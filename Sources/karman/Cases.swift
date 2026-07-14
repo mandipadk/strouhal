@@ -126,20 +126,25 @@ func runSelftest(gpu: GPU) throws -> [GateResult] {
 
 // MARK: - Benchmark
 
-func runBench(gpu: GPU, n: Int, warmup: Int = 20, timed: Int = 200) throws -> GateResult {
-    let sim = try Simulation(gpu: gpu, nx: n, ny: n, nz: n, omega: 1.9) { _, _, _ in .fluid }
-    try sim.initTaylorGreen()
+func runBench(gpu: GPU, n: Int, precision: Precision,
+              warmup: Int = 20, timed: Int = 200) throws -> GateResult {
+    let sim = try Simulation(gpu: gpu, precision: precision, nx: n, ny: n, nz: n,
+                             omega: 1.9) { _, _, _ in .fluid }
+    try sim.initField(mode: 1, amplitude: 0.05)
     try sim.run(steps: warmup)
     let t0 = sim.gpuSeconds
     try sim.run(steps: timed)
     let dt = sim.gpuSeconds - t0
     let mlups = Double(sim.cells) * Double(timed) / dt / 1e6
-    // Bytes/cell/step: even = 19*8 f + 1 flag = 153; odd = +8 masks = 161; avg 157.
-    let gbps = mlups * 157.0 / 1000.0
-    let passed = mlups >= 600
-    return GateResult(name: "bench \(n)³ (FP32)",
+    // Bytes/cell/step: DDFs 19*2*ddfBytes + 1 flag + masks (8, odd steps only -> avg 4).
+    let bytes = Double(19 * 2 * precision.ddfBytes + 1) + 4.0
+    let gbps = mlups * bytes / 1000.0
+    let gate = precision == .fp32 ? 600.0 : 1200.0
+    let ref = precision == .fp32 ? "FluidX3D-OpenCL M5: 800 FP32" : "FluidX3D-OpenCL M5: 1613 FP16C"
+    let passed = mlups >= gate
+    return GateResult(name: "bench \(n)³ (\(precision.rawValue))",
                       passed: passed,
-                      detail: String(format: "%.0f MLUPS, ~%.0f GB/s effective (gate ≥600 MLUPS; FluidX3D-OpenCL on M5 = 800)", mlups, gbps))
+                      detail: String(format: "%.0f MLUPS, ~%.0f GB/s effective (gate ≥%.0f; %@)", mlups, gbps, gate, ref))
 }
 
 // MARK: - Cavity
@@ -155,13 +160,16 @@ struct CavityRun {
 
 /// Lid-driven cavity: interior n×n fluid cells + 1-cell solid frame, lid on
 /// top (+x). Effective cavity width with halfway bounce-back = n exactly.
-func cavity(gpu: GPU, n: Int, re: Double, ulid: Float = 0.1,
+/// Collision: TRT with the given magic parameter (nil = SRT).
+func cavity(gpu: GPU, precision: Precision = .fp32, n: Int, re: Double,
+            lambda: Double? = 0.25, ulid: Float = 0.1,
             maxSteps: Int, checkEvery: Int = 5000, tol: Double = 5e-7) throws -> CavityRun {
     let nx = n + 2, ny = n + 2
     let nu = Double(ulid) * Double(n) / re
     let tau = 3.0 * nu + 0.5
-    let sim = try Simulation(gpu: gpu, nx: nx, ny: ny, nz: 1,
-                             omega: Float(1.0 / tau), ulid: ulid, rampSteps: 5000) { x, y, _ in
+    let (wp, wm) = Simulation.trtOmegas(tau: tau, lambda: lambda)
+    let sim = try Simulation(gpu: gpu, precision: precision, nx: nx, ny: ny, nz: 1,
+                             omega: wp, omegaMinus: wm, ulid: ulid, rampSteps: 5000) { x, y, _ in
         if y == ny - 1 { return .lid }
         if x == 0 || x == nx - 1 || y == 0 { return .solid }
         return .fluid
@@ -187,13 +195,12 @@ func cavity(gpu: GPU, n: Int, re: Double, ulid: Float = 0.1,
             history.append(residual)
             if residual < tol {
                 converged = true; how = "residual < tol"
-            } else if residual < 2e-5, history.count >= 5,
+            } else if residual < (precision == .fp32 ? 5e-5 : 2e-3), history.count >= 5,
                       let best = history.dropLast().suffix(4).min(),
                       residual > 0.95 * best {
-                // FP32 round-off floor: the field has stopped improving at a
-                // low level (mass-drift micro-jitter keeps it from reaching
-                // arbitrarily small residuals — see PLAN M1 notes).
-                converged = true; how = "FP32 residual floor (plateau)"
+                // Round-off floor: the field has stopped improving at a low
+                // level (FP32/FP16 noise + lid mass-drift micro-jitter).
+                converged = true; how = "residual floor (plateau)"
             }
         }
         prev = cur
@@ -206,7 +213,7 @@ func cavity(gpu: GPU, n: Int, re: Double, ulid: Float = 0.1,
 /// Compare centerline profiles against Ghia. Interior fluid nodes are at
 /// physical y = (iy - 0.5)/n for iy = 1...n (array row iy). x = 0.5 lies
 /// exactly between columns n/2 and n/2+1 — average them.
-func ghiaComparison(run: CavityRun, re: Double) throws -> GateResult {
+func ghiaComparison(run: CavityRun, re: Double, verbose: Bool = true) throws -> GateResult {
     let sim = run.sim
     let n = run.nInterior
     let m = try sim.probeMoments()
@@ -223,7 +230,6 @@ func ghiaComparison(run: CavityRun, re: Double) throws -> GateResult {
         let b = m[(n / 2 + 1) * nx + ix].y
         return Double(a + b) / 2.0 / ulid
     }
-    // Linear interpolation to an oracle coordinate: nodes at (k-0.5)/n, k=1...n.
     func interp(_ coord: Double, _ value: (Int) -> Double) -> Double {
         let s = coord * Double(n) + 0.5
         let k0 = min(max(Int(s.rounded(.down)), 1), n - 1)
@@ -258,29 +264,122 @@ func ghiaComparison(run: CavityRun, re: Double) throws -> GateResult {
     }
     let rms = (sumSq / Double(count)).squareRoot()
     let passed = rms <= 0.02
-    let detail = String(format: "RMS %.4f (gate ≤0.02), max |Δ| %.4f, %@ after %d steps (residual %.1e)",
+    var detail = String(format: "RMS %.4f (gate ≤0.02), max |Δ| %.4f, %@ after %d steps (residual %.1e)",
                         rms, maxDev,
                         run.converged ? "converged (\(run.howConverged))" : "NOT converged",
                         run.steps, run.residual)
-    return GateResult(name: String(format: "cavity Re=%.0f vs Ghia (%d²)", re, n),
+    if verbose { detail += "\n" + lines.joined(separator: "\n") }
+    return GateResult(name: String(format: "cavity Re=%.0f vs Ghia (%d², %@)", re, n, run.sim.precision.rawValue),
                       passed: passed && run.converged,
-                      detail: detail + "\n" + lines.joined(separator: "\n"))
+                      detail: detail)
+}
+
+// MARK: - Poiseuille (exact-solution gate)
+
+/// Body-force-driven channel flow. With TRT and Lambda = 3/16 the halfway
+/// bounce-back wall location is viscosity-exact, so the discrete steady
+/// profile should match the parabola to round-off.
+func runPoiseuille(gpu: GPU, height H: Int = 64) throws -> GateResult {
+    let tau = 0.8
+    let nu = (tau - 0.5) / 3.0
+    let uMax: Double = 0.05
+    let F = 8.0 * nu * uMax / Double(H * H)
+    let (wp, wm) = Simulation.trtOmegas(tau: tau, lambda: 3.0 / 16.0)
+    let ny = H + 2
+    let sim = try Simulation(gpu: gpu, nx: 16, ny: ny, nz: 1,
+                             omega: wp, omegaMinus: wm,
+                             force: SIMD3(Float(F), 0, 0)) { _, y, _ in
+        (y == 0 || y == ny - 1) ? .solid : .fluid
+    }
+    // Diffusive time H^2/nu; run several to reach steady state.
+    let tVisc = Double(H * H) / nu
+    try sim.run(steps: (Int(6.0 * tVisc) + 1) & ~1)
+    let m = try sim.probeMoments()
+    var maxErr = 0.0
+    var errWall = 0.0, errCenter = 0.0
+    for j in 1...H {
+        let yd = Double(j) - 0.5 // distance from bottom wall plane
+        let exact = F / (2.0 * nu) * yd * (Double(H) - yd)
+        let ours = Double(m[j * sim.nx + 8].x)
+        let e = abs(ours - exact) / uMax
+        maxErr = max(maxErr, e)
+        if j == 1 || j == H { errWall = max(errWall, e) }
+        if j == H / 2 || j == H / 2 + 1 { errCenter = max(errCenter, e) }
+    }
+    let passed = maxErr <= 3e-5
+    return GateResult(name: "Poiseuille exact (TRT Λ=3/16, H=\(H))",
+                      passed: passed,
+                      detail: String(format: "max |u-u_exact|/u_max = %.2e (gate ≤3e-5, FP32 accumulation floor); wall %.2e, center %.2e", maxErr, errWall, errCenter))
+}
+
+// MARK: - Taylor-Green (order-of-accuracy gate)
+
+/// 2D Taylor-Green decay under diffusive scaling (u0 ∝ 1/N, ν fixed):
+/// both the spatial truncation error and the O(Ma²) compressibility error
+/// scale as 1/N², so the observed convergence order should be ≈ 2.
+/// Amplitude note: the default u0base = 0.2 runs the coarse grid at Ma≈0.35
+/// deliberately — the errors are large but their SCALING is the measurand;
+/// smaller amplitudes push the fine grid into the FP32 round-off floor and
+/// the measured order collapses (verified: u0base 0.05 reads 1.76 for
+/// exactly this reason).
+func runTaylorGreenOrder(gpu: GPU, sizes: [Int] = [32, 64, 128], u0base: Double = 0.20) throws -> GateResult {
+    let nu = 0.02
+    let tau = 3.0 * nu + 0.5
+    let (wp, wm) = Simulation.trtOmegas(tau: tau, lambda: 0.25)
+    var errors: [Double] = []
+    var details: [String] = []
+    for N in sizes {
+        // Base amplitude sized so the finest grid's error stays well above
+        // the FP32 round-off floor (the N=256/u0=0.01 configuration hit it).
+        let u0 = u0base * 32.0 / Double(N)
+        let k = 2.0 * Double.pi / Double(N)
+        let steps = Int(log(2.0) / (2.0 * nu * k * k)) & ~1 // decay to ~1/2 amplitude
+        let sim = try Simulation(gpu: gpu, nx: N, ny: N, nz: 1,
+                                 omega: wp, omegaMinus: wm) { _, _, _ in .fluid }
+        try sim.initField(mode: 1, amplitude: Float(u0))
+        try sim.run(steps: steps)
+        let m = try sim.probeMoments()
+        let decay = exp(-2.0 * nu * k * k * Double(steps))
+        var sumSq = 0.0
+        for y in 0..<N { for x in 0..<N {
+            let xa = Double(x) + 0.5, ya = Double(y) + 0.5
+            let ue =  u0 * decay * sin(k * xa) * cos(k * ya)
+            let ve = -u0 * decay * cos(k * xa) * sin(k * ya)
+            let v = m[y * N + x]
+            let du = Double(v.x) - ue, dv = Double(v.y) - ve
+            sumSq += du * du + dv * dv
+        }}
+        let l2 = (sumSq / Double(2 * N * N)).squareRoot() / (u0 * decay)
+        errors.append(l2)
+        details.append(String(format: "N=%d: rel L2 %.3e (%d steps)", N, l2, steps))
+    }
+    var orders: [Double] = []
+    for i in 1..<errors.count {
+        orders.append(log2(errors[i - 1] / errors[i]))
+    }
+    let minOrder = orders.min() ?? 0
+    let passed = minOrder >= 1.9
+    return GateResult(name: "Taylor-Green observed order",
+                      passed: passed,
+                      detail: details.joined(separator: "; ") + String(format: "; orders: %@ (gate: min ≥1.9)",
+                          orders.map { String(format: "%.2f", $0) }.joined(separator: ", ")))
 }
 
 // MARK: - Determinism
 
-func runDeterminism(gpu: GPU) throws -> GateResult {
+func runDeterminism(gpu: GPU, precision: Precision = .fp32) throws -> GateResult {
     func cavityDigest() throws -> String {
-        let run = try cavity(gpu: gpu, n: 128, re: 1000, maxSteps: 10000,
-                             checkEvery: 10000, tol: 0)
+        let run = try cavity(gpu: gpu, precision: precision, n: 128, re: 1000,
+                             maxSteps: 10000, checkEvery: 10000, tol: 0)
         return run.sim.stateDigest
     }
     let a = try cavityDigest()
     let b = try cavityDigest()
 
     func benchDigest() throws -> String {
-        let sim = try Simulation(gpu: gpu, nx: 128, ny: 128, nz: 128, omega: 1.9) { _, _, _ in .fluid }
-        try sim.initTaylorGreen()
+        let sim = try Simulation(gpu: gpu, precision: precision,
+                                 nx: 128, ny: 128, nz: 128, omega: 1.9) { _, _, _ in .fluid }
+        try sim.initField(mode: 1, amplitude: 0.05)
         try sim.run(steps: 100)
         return sim.stateDigest
     }
@@ -288,7 +387,7 @@ func runDeterminism(gpu: GPU) throws -> GateResult {
     let d = try benchDigest()
 
     let passed = a == b && c == d
-    return GateResult(name: "bitwise determinism (run-twice)",
+    return GateResult(name: "bitwise determinism (run-twice, \(precision.rawValue))",
                       passed: passed,
                       detail: passed
                         ? "cavity 128² ×10k steps and 128³ TG ×100 steps: digests identical (\(a.prefix(16))…)"

@@ -28,7 +28,8 @@ func main() throws {
         results = try runSelftest(gpu: gpu)
     case "bench":
         let n = args.dropFirst().first.flatMap { Int($0) } ?? 256
-        results = [try runBench(gpu: gpu, n: n)]
+        results = [try runBench(gpu: gpu, n: n, precision: .fp32),
+                   try runBench(gpu: gpu, n: n, precision: .fp16s)]
     case "cavity":
         let re = args.dropFirst().first.flatMap { Double($0) } ?? 1000
         let n = args.dropFirst(2).first.flatMap { Int($0) } ?? 256
@@ -37,7 +38,46 @@ func main() throws {
         print(String(format: "mass drift: %.3e", run.sim.massSum()))
         results = [try ghiaComparison(run: run, re: re)]
     case "determinism":
-        results = [try runDeterminism(gpu: gpu)]
+        results = [try runDeterminism(gpu: gpu, precision: .fp32),
+                   try runDeterminism(gpu: gpu, precision: .fp16s)]
+    case "poiseuille":
+        results = [try runPoiseuille(gpu: gpu)]
+    case "tgorder":
+        let u0 = args.dropFirst().first.flatMap { Double($0) } ?? 0.20
+        results = [try runTaylorGreenOrder(gpu: gpu, u0base: u0)]
+    case "m1":
+        print("— selftest —")
+        results += try runSelftest(gpu: gpu)
+        results.forEach(printResult)
+        guard results.allSatisfy(\.passed) else { break }
+
+        print("— bench (both precisions) —")
+        for prec in [Precision.fp32, .fp16s] {
+            let r = try runBench(gpu: gpu, n: 256, precision: prec)
+            printResult(r); results.append(r)
+        }
+        print("— determinism (fp16s) —")
+        let det16 = try runDeterminism(gpu: gpu, precision: .fp16s)
+        printResult(det16); results.append(det16)
+
+        print("— Poiseuille exact —")
+        let poise = try runPoiseuille(gpu: gpu)
+        printResult(poise); results.append(poise)
+
+        print("— Taylor-Green order —")
+        let tg = try runTaylorGreenOrder(gpu: gpu)
+        printResult(tg); results.append(tg)
+
+        print("— cavity Re=1000: fp32+TRT, fp16s+SRT —")
+        // FP16S pairs with SRT: TRT's antisymmetric mode is a difference of
+        // two half-quantized values, which amplifies quantization noise
+        // (FluidX3D defaults to SRT for the same reason).
+        for (prec, lam) in [(Precision.fp32, Optional(0.25)), (.fp16s, nil)] {
+            let run = try cavity(gpu: gpu, precision: prec, n: 256, re: 1000,
+                                 lambda: lam, maxSteps: 1_200_000)
+            let g = try ghiaComparison(run: run, re: 1000, verbose: false)
+            printResult(g); results.append(g)
+        }
     case "m0":
         print("— selftest —")
         results += try runSelftest(gpu: gpu)
@@ -45,12 +85,12 @@ func main() throws {
         guard results.allSatisfy(\.passed) else { break }
 
         print("— determinism —")
-        let det = try runDeterminism(gpu: gpu)
+        let det = try runDeterminism(gpu: gpu, precision: .fp32)
         printResult(det)
         results.append(det)
 
         print("— bench 256³ —")
-        let bench = try runBench(gpu: gpu, n: 256)
+        let bench = try runBench(gpu: gpu, n: 256, precision: .fp32)
         printResult(bench)
         results.append(bench)
 
