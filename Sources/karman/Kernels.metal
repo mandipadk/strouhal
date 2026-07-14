@@ -169,11 +169,36 @@ inline void collide(thread float* fh, constant Params& p, int x, float eps,
     const float ap = 1.0f - 0.5f * wp;   // even-source prefactor
     const float am = 1.0f - 0.5f * wm;   // odd-source prefactor
 
-    float B = 0.0f;
-    if (eps > 0.0f) {
-        const float tw = 1.0f / wp - 0.5f;
-        B = eps * tw / ((1.0f - eps) + tw);
+    // The B == 0 path keeps the ORIGINAL arithmetic exactly: multiplying the
+    // collision increments by (1-B)=1.0 changes the rounding pattern, and at
+    // the FP32 accumulation floor that regressed the Poiseuille-exact gate
+    // 12x. Bit-compatibility of the golden path is part of the contract.
+    if (eps == 0.0f) {
+        { // rest direction: purely symmetric
+            const float feq0 = W[0] * (rhom1 - 1.5f * rho * u2);
+            const float s0   = W[0] * ap * (-3.0f * uF);
+            fh[0] = fma(wp, feq0 - fh[0], fh[0]) + s0;
+        }
+        for (int i = 1; i < 19; i += 2) {
+            const float cu = 3.0f * ((float)Cx[i]*ux + (float)Cy[i]*uy + (float)Cz[i]*uz);
+            const float cF = (float)Cx[i]*p.fx + (float)Cy[i]*p.fy + (float)Cz[i]*p.fz;
+            const float feqp = W[i] * (rhom1 + rho * (0.5f*cu*cu - 1.5f*u2)); // symmetric eq
+            const float feqm = W[i] * rho * cu;                               // antisymmetric eq
+            const float fp = 0.5f * (fh[i] + fh[i+1]);
+            const float fm = 0.5f * (fh[i] - fh[i+1]);
+            const float dp = wp * (feqp - fp);
+            const float dm = wm * (feqm - fm);
+            // Guo source, TRT-split: odd part 3(c.F); even part 3 cu (c.F) - 3 u.F
+            const float sm = W[i] * am * (3.0f * cF);
+            const float sp = W[i] * ap * (3.0f * cu * cF - 3.0f * uF);
+            fh[i]   += dp + dm + sp + sm;
+            fh[i+1] += dp - dm + sp - sm;
+        }
+        return;
     }
+
+    const float tw = 1.0f / wp - 0.5f;
+    const float B = eps * tw / ((1.0f - eps) + tw);
     const float oneMinusB = 1.0f - B;
 
     { // rest direction: purely symmetric (bounce term vanishes)
@@ -190,7 +215,6 @@ inline void collide(thread float* fh, constant Params& p, int x, float eps,
         const float fm = 0.5f * (fh[i] - fh[i+1]);
         const float dp = wp * (feqp - fp);
         const float dm = wm * (feqm - fm);
-        // Guo source, TRT-split: odd part 3(c.F); even part 3 cu (c.F) - 3 u.F
         const float sm = W[i] * am * (3.0f * cF);
         const float sp = W[i] * ap * (3.0f * cu * cF - 3.0f * uF);
         const float bounce = B * (fh[i+1] - fh[i]); // static wall (u_w = 0)
