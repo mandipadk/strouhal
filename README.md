@@ -57,4 +57,4 @@ reference — if something fails on your machine, that's a bug report we want.
 - FP16 storage pairs with SRT collision by design: TRT's antisymmetric mode
   is a difference of two half-quantized values, which amplifies quantization
   noise (measured: Ghia RMS degrades 5× with TRT at FP16).
-- License: to be finalized. Until a LICENSE file lands, all rights reserved.
+- License: [Apache-2.0](LICENSE).
