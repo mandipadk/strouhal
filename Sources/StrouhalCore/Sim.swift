@@ -57,9 +57,16 @@ struct Pipelines {
     let initField: MTLComputePipelineState
 }
 
-public final class GPU {
+/// Metal device plus a lazily-compiled pipeline cache.
+///
+/// Sendable by contract: `device` and `queue` are thread-safe Metal objects,
+/// `source` is immutable, and the two caches are guarded by `cacheLock`. The
+/// lock is not decorative — the instrument builds cases on a background
+/// thread while the render loop draws, so both touch the cache concurrently.
+public final class GPU: @unchecked Sendable {
     public let device: MTLDevice
     public let queue: MTLCommandQueue
+    private let cacheLock = NSLock()
     private var pipelines: [Precision: Pipelines] = [:]
     private var libraries: [Precision: MTLLibrary] = [:]
     private let source: String
@@ -78,6 +85,13 @@ public final class GPU {
     }
 
     func pipelines(for precision: Precision) throws -> Pipelines {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return try pipelinesLocked(for: precision)
+    }
+
+    /// Caller must hold `cacheLock`.
+    private func pipelinesLocked(for precision: Precision) throws -> Pipelines {
         if let p = pipelines[precision] { return p }
         let options = MTLCompileOptions()
         // The determinism contract: no fast-math transforms, precise library
@@ -105,7 +119,9 @@ public final class GPU {
     /// fullscreen-quad render pipeline for the given drawable pixel format.
     public func makeVizPipelines(precision: Precision, pixelFormat: MTLPixelFormat)
         throws -> (colorize: MTLComputePipelineState, quad: MTLRenderPipelineState) {
-        _ = try pipelines(for: precision) // ensures the library is compiled
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        _ = try pipelinesLocked(for: precision) // ensures the library is compiled
         guard let library = libraries[precision] else {
             throw StrouhalError.message("library missing")
         }

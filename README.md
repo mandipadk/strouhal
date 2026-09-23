@@ -39,6 +39,7 @@ Physics gates currently passing (run them yourself, see below):
 | Vortex street (DFG 2D-2) | Schäfer & Turek (1996) | St 0.2996 [0.295, 0.305], max C_L 0.9998 [0.99, 1.01] |
 | **Taylor–Green 3D, Re 1600** | Incompact3d 512³ DNS / HiOCFD | peak ε at t* 9.09 (DNS 8.98); finest pair converged to 0.25%; peak −7.5% with the deficit attributed by measurement (compressibility ruled out; 2nd-order resolution) |
 | Curved boundaries (Noble–Torczynski) | DFG 2D-2 peaks | max C_L gate active at D=64 |
+| Sphere drag, hardened | Schiller–Naumann correlation (±5%) | resolution ladder + Mach anchor, calibrated bar |
 | Bitwise determinism | — | identical SHA-256 state digests, both precisions |
 
 Streaming/parity proofs: rest states are bitwise fixed points; a lone
@@ -66,12 +67,48 @@ swift build -c release
 .build/release/strouhal m3      # STL voxelizer, 3D sphere wake
 .build/release/strouhal m4      # the credibility run: ladder + Mach anchor + report
 .build/release/strouhal m5      # Taylor-Green Re=1600 vs published DNS
+.build/release/strouhal m6      # hardening a 3D body: the sphere credibility run
 .build/release/StrouhalApp      # the live instrument
 sh scripts/make-app.sh          # bundle dist/Strouhal.app
 ```
 
 Every gate prints its measured value next to its threshold and its source
 reference — if something fails on your machine, that's a bug report we want.
+
+## Hardening a number
+
+Any quantity the app reports can be *hardened*: it re-runs the case across a
+resolution ladder and a half-Mach anchor and assembles
+
+    U(φ) = k·√(u_num² + u_stat² + u_Ma²),  k = 2 (≈95%)
+
+then attaches a validation-domain verdict and exports a Markdown report in
+ASME V&V 20 vocabulary. This works on the built-in cases and on your own
+imported geometry. It costs minutes, and it runs on a second GPU queue so the
+live view keeps going.
+
+The transient is not a guessed number of steps. Each run continues until its
+quantity genuinely stops moving, because a guess here is silently wrong: the
+sphere's drag was measured passing through 3.13, down to 0.97, up to 1.58, and
+only flattening near 1.3653 after about 150 convective times. Averaging inside
+that ramp yields a plausible value with an error bar that describes an
+unconverged drift rather than any real uncertainty.
+
+What it refuses to do matters as much:
+
+- **No Grid Convergence Index.** Richardson extrapolation assumes monotone
+  convergence at a fitted order, which scale-resolving simulations do not
+  guarantee. The observed order is printed as a diagnostic, never as the basis
+  of the bar.
+- **No calibrated bar outside the validated domain.** An arbitrary imported
+  shape has no validation anchor, so the report gives the measured components
+  and states plainly that whether the solver reproduces reality *for that
+  shape* is not established.
+- **No model-form uncertainty claim**, which would need multi-model variation.
+
+A small numerical uncertainty is not the same as a correct answer. In the FDA's
+blood-nozzle round-robin, numerical uncertainty was under 1% while results were
+about 33% off experiment.
 
 ## Notes
 

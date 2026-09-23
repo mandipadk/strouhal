@@ -1,0 +1,55 @@
+# The gates are this project's central claim, so CI runs as many of them as
+# the runner can actually support — and says plainly which ones it could not.
+#
+# Every physics gate needs a Metal device. GitHub's macOS runners are
+# virtualised and may or may not expose one, so the gate steps detect a
+# missing device and report it as "not verified here" rather than passing
+# silently. A gate that fails for any other reason fails the build.
+name: gates
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  build-and-gate:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Swift version
+        run: swift --version
+
+      - name: Build (release)
+        run: swift build -c release
+
+      - name: Self-test and determinism
+        run: |
+          set -o pipefail
+          if ! out=$(.build/release/strouhal selftest 2>&1); then
+            echo "$out"
+            if echo "$out" | grep -qi "no.*metal\|noDevice"; then
+              echo "::warning::No Metal device on this runner — physics gates not verified here."
+              echo "NO_GPU=1" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            exit 1
+          fi
+          echo "$out"
+
+      - name: Engine gates (m1)
+        if: env.NO_GPU != '1'
+        run: .build/release/strouhal m1
+
+      - name: Vortex street gates (m2)
+        if: env.NO_GPU != '1'
+        run: .build/release/strouhal m2
+
+      - name: Summary
+        run: |
+          if [ "${NO_GPU:-0}" = "1" ]; then
+            echo "Built successfully. Physics gates require Apple silicon with a"
+            echo "Metal device; run them locally:  .build/release/strouhal m1"
+          else
+            echo "Build and physics gates passed."
+          fi

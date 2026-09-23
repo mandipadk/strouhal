@@ -1324,3 +1324,112 @@ func runTGV1600(gpu: GPU, sizes: [Int] = [288, 320]) throws -> [GateResult] {
                                          finest.peakEps, err * 100)))
     return out
 }
+
+// MARK: - M6: hardening a 3D body
+
+/// The sphere credibility run. This is the gate that says the flagship
+/// feature works on a real body and not only on the 2D demo: it must produce
+/// a calibrated bar, land near the Schiller–Naumann correlation, and report
+/// a steady QoI as steady rather than as weak statistics.
+func runBodyCredibility(gpu: GPU, resolutions: [Int] = [16, 22, 32]) throws -> [GateResult] {
+    var out: [GateResult] = []
+    let re = 100.0
+    let ladder = BodyLadder(body: .sphere, name: "sphere", re: re, anchored: true)
+    let est = BodyLadder.estimatedSeconds(resolutions: resolutions,
+                                          machAnchor: resolutions.sorted()[resolutions.count / 2])
+    print(String(format: "      (estimate %.0f s)", est))
+    let run = try Ladder.credibility(gpu: gpu, case: ladder, qoi: "C_D",
+                                     resolutions: resolutions,
+                                     machAnchorResolution: resolutions.sorted()[resolutions.count / 2]) {
+        print("      … \($0)")
+    }
+    let b = run.budget
+
+    out.append(GateResult(name: "M6 sphere produces a calibrated bar",
+                          passed: b.combined.isFinite && b.combined > 0,
+                          detail: String(format: "%@ · u_num %.4f, u_stat %.4f, u_Ma %.4f · %.0f s wall (est %.0f)",
+                                         b.headline, b.uNum, b.uStat, b.uMa, run.wallSeconds, est)))
+
+    // Schiller–Naumann is a ±5% correlation for an unbounded sphere; our box
+    // is finite, so the gate is generous and REPORTS the gap rather than
+    // pretending the two are the same quantity.
+    let cdRef = 24.0 / re * (1.0 + 0.15 * pow(re, 0.687))
+    let err = abs(b.value - cdRef) / cdRef
+    out.append(GateResult(name: "M6 sphere C_D near Schiller–Naumann",
+                          passed: err <= 0.30,
+                          detail: String(format: "%.4f vs %.4f (%+.1f%%, gate ≤30%%: finite box + NT effective radius; correlation itself ±5%%)",
+                                         b.value, cdRef, (b.value - cdRef) / cdRef * 100)))
+
+    let lad = run.rungs.map { String(format: "%d:%.4f", $0.cellsPerFeature, $0.value) }
+        .joined(separator: " → ")
+    out.append(GateResult(name: "M6 ladder + Mach anchor recorded",
+                          passed: run.rungs.count == resolutions.count,
+                          detail: lad + String(format: " · half-Mach %.4f → %.4f", run.machBaseline, run.machHalf)))
+
+    // The steady-flow statistics fix: a Re=100 sphere wake is steady, and the
+    // old code reported that as "statistics weak" because zero batch variance
+    // makes the lag-1 autocorrelation NaN.
+    let weak = b.notes.contains { $0.hasPrefix("statistics weak") }
+    out.append(GateResult(name: "M6 steady wake not mislabelled as weak statistics",
+                          passed: !weak,
+                          detail: weak ? "FAILED: reported weak statistics on a steady QoI"
+                                       : "steady QoI reported as steady (batches \(run.statBatches))"))
+
+    // The product's hardest honesty test. The sphere in a 4D box sits well
+    // outside its own error bar relative to Schiller–Naumann, because the
+    // finite domain biases the drag. The tool must SAY that the uncertainty
+    // fails to cover the gap rather than letting a small bar imply a correct
+    // answer — the FDA nozzle failure mode, caught in our own output.
+    if let cmp = run.comparison {
+        let e = b.value - cmp.reference
+        let statesIt = !cmp.covered
+        out.append(GateResult(name: "M6 reports the comparison error honestly",
+                              passed: statesIt,
+                              detail: String(format: "E = S − D = %+.4f (%+.1f%%) vs U(φ) = %.4f → reported as %@",
+                                             e, e / cmp.reference * 100, b.combined,
+                                             cmp.covered ? "covered" : "NOT covered (correct: the bar is numerical only)")))
+    }
+
+    // The adversarial half: an unanchored geometry must NOT receive a
+    // calibrated bar just because it ran successfully.
+    let custom = ValidationDomain.classify(re: re, mach: 0.087, cellsPerFeature: 40,
+                                           geometry: "custom body in free stream")
+    var refused = false
+    if case .outside = custom { refused = true }
+    out.append(GateResult(name: "M6 unanchored geometry refuses a calibrated bar",
+                          passed: refused,
+                          detail: refused ? "custom body → OUTSIDE the validated domain, U(φ) withheld"
+                                          : "FAILED TO REFUSE: an arbitrary shape would get a calibrated bar"))
+    return out
+}
+
+/// Print C_D against convective time for one sphere resolution, to MEASURE
+/// how long the wake actually takes to settle instead of assuming it.
+func debugBodySettling(gpu: GPU, D: Int = 28, convectiveTimes: Double = 80) throws {
+    let ladder = BodyLadder(body: .sphere, name: "sphere", re: 100, anchored: true)
+    let v = try ladder.variant(gpu: gpu, cellsPerFeature: D, machScale: 1.0)
+    let tc = Double(D) / 0.05            // steps per body convective time D/u
+    let sampleEvery = max(2, Int(tc / 4)) & ~1
+    let total = Int(tc * convectiveTimes)
+    print("D=\(D)  grid \(v.sim.nx)³  D/u = \(Int(tc)) steps  ramp \(v.sim.rampSteps)")
+    print("   t(D/u)      C_D")
+    var done = 0
+    while done < total {
+        try v.sim.run(steps: sampleEvery)
+        done += sampleEvery + 2
+        let cd = try v.probe(v.sim)
+        print(String(format: "   %7.1f   %8.4f", Double(v.sim.stepsDone) / tc, cd))
+    }
+}
+
+/// Report where adaptive settling actually triggers, and what it converged to.
+func debugSettleTrigger(gpu: GPU, D: Int) throws {
+    let ladder = BodyLadder(body: .sphere, name: "sphere", re: 100, anchored: true)
+    let v = try ladder.variant(gpu: gpu, cellsPerFeature: D, machScale: 1.0)
+    let tc = Double(D) / 0.05
+    let (series, stat, _, converged) = try Ladder.measure(v, qoi: "C_D")
+    print(String(format: "D=%d settled by t=%.0f D/u (%@) · C_D %.4f · steady=%@ · u_stat %.4f · %d batches",
+                 D, Double(v.sim.stepsDone) / tc, converged ? "converged" : "HIT CAP",
+                 stat.mean, stat.steady ? "yes" : "no", stat.halfWidth95, stat.batches))
+    _ = series
+}

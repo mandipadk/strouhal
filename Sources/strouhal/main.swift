@@ -51,6 +51,17 @@ func main() throws {
         let tEnd = args.dropFirst(3).first.flatMap { Double($0) } ?? 10.5
         _ = try tgvRun(gpu: gpu, n: n, u0: u0, tEnd: tEnd) { print("      \($0)") }
         results = []
+    case "debugsettle":
+        try debugSettleTrigger(gpu: gpu, D: args.dropFirst().first.flatMap { Int($0) } ?? 28)
+        results = []
+    case "debugbody":
+        let d = args.dropFirst().first.flatMap { Int($0) } ?? 28
+        let tc = args.dropFirst(2).first.flatMap { Double($0) } ?? 80
+        try debugBodySettling(gpu: gpu, D: d, convectiveTimes: tc)
+        results = []
+    case "m6":
+        print("— hardening a 3D body: the sphere credibility run —")
+        results = try runBodyCredibility(gpu: gpu)
     case "m5":
         print("— TGV Re=1600 vs DNS (the 3D turbulence anchor) —")
         results = try runTGV1600(gpu: gpu)

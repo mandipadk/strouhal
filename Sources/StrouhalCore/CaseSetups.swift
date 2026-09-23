@@ -172,6 +172,9 @@ public struct StreetLadder: LadderableCase {
     public var setupDescription: String {
         String(format: "Schäfer–Turek DFG 2D-2 · cylinder in a channel · Re %.0f · velocity-wall inlet and outlet · NT curved body · outlet sponge · cosine ramp", re)
     }
+    public var reference: (value: Double, source: String)? {
+        (3.18, "Featflow DFG 2D-2 benchmark, level-6 mean C_D")
+    }
     public var geometryClass: String { "bluff body in channel" }
 
     public func variant(gpu: GPU, cellsPerFeature: Int, machScale: Double) throws -> LadderVariant {
@@ -198,5 +201,149 @@ public struct StreetLadder: LadderableCase {
                 return 2.0 * f.x / (uMean * uMean * Double(cellsPerFeature))
             },
             transientSteps: transient, sampleSteps: sample, stride: stride)
+    }
+}
+
+/// A 3D body in a free stream, rebuildable at any resolution — the ladder
+/// behind "Harden this number" for the sphere and for imported geometry.
+///
+/// The domain scales with the body so blockage stays fixed (4D × 4D × 4D with
+/// the body at 1.5D, the geometry the sphere gate is measured on): changing
+/// resolution must change ONLY resolution, or the ladder measures the wrong
+/// thing.
+public struct BodyLadder: LadderableCase {
+    public enum Body: Sendable {
+        case sphere
+        case mesh(StlMesh)
+    }
+
+    public let body: Body
+    public let name: String
+    public let re: Double
+    public let baseMach: Double        // lattice velocity at full Mach
+    /// Sphere drag is anchored by the Schiller–Naumann correlation; an
+    /// arbitrary imported body has no such anchor, and the report must say so
+    /// rather than implying the solver is validated for that shape.
+    public let anchored: Bool
+
+    public init(body: Body, name: String, re: Double = 100.0,
+                baseMach: Double = 0.05, anchored: Bool = false) {
+        self.body = body
+        self.name = name
+        self.re = re
+        self.baseMach = baseMach
+        self.anchored = anchored
+    }
+
+    public var setupDescription: String {
+        String(format: "%@ · 3D body in a free stream · Re %.0f · uniform inflow, periodic lateral, NT body, outlet sponge",
+               name, re)
+    }
+    public var geometryClass: String {
+        anchored ? "bluff body in free stream" : "custom body in free stream"
+    }
+    /// Schiller–Naumann for the sphere; an imported body has no published
+    /// value to compare against, and inventing one would be worse than none.
+    public var reference: (value: Double, source: String)? {
+        guard case .sphere = body else { return nil }
+        return (24.0 / re * (1.0 + 0.15 * pow(re, 0.687)),
+                "Schiller–Naumann correlation, ±5%")
+    }
+
+    public func variant(gpu: GPU, cellsPerFeature D: Int, machScale: Double) throws -> LadderVariant {
+        let u = Float(baseMach * machScale)
+        let (nx, ny, nz) = (4 * D, 4 * D, 4 * D)
+        let nu = Double(u) * Double(D) / re
+        let (wp, wm) = Simulation.trtOmegas(tau: 3.0 * nu + 0.5, lambda: 3.0 / 16.0)
+        let cx = 0.5 + 1.5 * Double(D)
+        let cy = Double(ny) / 2.0, cz = Double(nz) / 2.0
+        // The ramp scales with the domain crossing time so every rung sees the
+        // same physical start-up, not the same step count.
+        let crossing = Double(nx) / Double(u)
+        let ramp = Int(crossing * 0.5) & ~1
+        let sim = try Simulation(gpu: gpu, nx: nx, ny: ny, nz: nz,
+                                 omega: wp, omegaMinus: wm,
+                                 uin: u, rampSteps: ramp, wantsForces: true) { x, _, _ in
+            (x == 0 || x == nx - 1) ? .inflow : .fluid
+        }
+        sim.inflowUniform = true
+
+        let eps: [Float]
+        var area: Double
+        switch body {
+        case .sphere:
+            eps = sphereSolidFractions(nx: nx, ny: ny, nz: nz,
+                                       cx: cx, cy: cy, cz: cz, r: Double(D) / 2.0)
+            area = Double.pi * Double(D) * Double(D) / 4.0
+        case .mesh(let mesh):
+            let ext = mesh.boundsMax - mesh.boundsMin
+            let maxExt = max(ext.x, max(ext.y, ext.z))
+            let scale = Float(D) / maxExt
+            let centre = (mesh.boundsMin + mesh.boundsMax) * 0.5
+            let target = SIMD3<Float>(Float(cx), Float(cy), Float(cz))
+            eps = meshSolidFractions(mesh: mesh, nx: nx, ny: ny, nz: nz,
+                                     scale: scale, offset: target - centre * scale)
+            // Frontal area straight from the voxelization, so the coefficient
+            // and the geometry can never disagree.
+            area = 0
+            for z in 0..<nz { for y in 0..<ny {
+                var m: Float = 0
+                for x in 0..<nx { m = max(m, eps[(z * ny + y) * nx + x]) }
+                area += Double(m)
+            }}
+        }
+        guard area > 0 else {
+            throw StrouhalError.message("body voxelized to nothing at \(D) cells — check the units")
+        }
+        try sim.setSolidFractions(eps)
+        sim.sponge = (x0: Float(nx - 1 - D), width: Float(D), tau: 1.0)
+
+        let pad = max(4, D / 8)
+        let boxX = max(1, Int(cx) - D / 2 - pad)...min(nx - 2, Int(cx) + D / 2 + pad)
+        let boxY = max(0, Int(cy) - D / 2 - pad)...min(ny - 1, Int(cy) + D / 2 + pad)
+        let uLat = Double(u)
+        let frontal = area
+        // Everything below is in body convective times D/u, the scale the
+        // wake actually establishes on. Measured at D=28, Re=100: C_D passes
+        // through 3.13 → 0.97 → 1.58 and only flattens near 1.3653 after
+        // ~150 D/u, so a transient set by domain crossings (≈6 D/u) sampled
+        // pure transient. The run now settles adaptively and stops when the
+        // drag genuinely stops moving.
+        let tc = Double(D) / uLat
+        return LadderVariant(
+            sim: sim,
+            mach: uLat * 3.0.squareRoot(),
+            probe: { s in
+                let f = try s.probeForce(xRange: boxX, yRange: boxY)
+                return 2.0 * f.x / (uLat * uLat * frontal)
+            },
+            transientSteps: Int(tc * 25) & ~1,
+            sampleSteps: Int(tc * 24) & ~1,
+            stride: max(8, Int(tc / 8)) & ~1,      // ~192 samples to average
+            // The settling window must span MORE than one period of the
+            // start-up oscillation, or it mistakes a turning point for
+            // convergence: the measured sphere transient swings with a period
+            // near 26 D/u, and at each extremum a short window reads flat.
+            // 80 samples at 0.5 D/u spans 40 D/u, comfortably over a period.
+            settleTolerance: 0.005,
+            settleWindow: 80,
+            maxTransientSteps: Int(tc * 200) & ~1,
+            settleStride: max(8, Int(tc / 2)) & ~1)
+    }
+
+    /// Rough wall-clock estimate for a full credibility run, so the app can
+    /// tell the user what they are committing to before they commit.
+    public static func estimatedSeconds(resolutions: [Int], machAnchor: Int,
+                                        mlups: Double = 700) -> Double {
+        func cost(_ D: Int, machScale: Double) -> Double {
+            let cells = Double(4 * D * 4 * D * 4 * D)
+            let tc = Double(D) / (0.05 * machScale)   // steps per D/u
+            // Typical settle observed ≈110 D/u, plus 20 D/u of sampling.
+            let steps = tc * 205   // measured: settle ≈180 D/u + 24 sampling
+            return steps * cells / (mlups * 1e6)
+        }
+        var total = resolutions.reduce(0.0) { $0 + cost($1, machScale: 1.0) }
+        total += cost(machAnchor, machScale: 0.5)
+        return total
     }
 }

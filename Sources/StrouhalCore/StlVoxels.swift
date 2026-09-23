@@ -3,7 +3,7 @@ import simd
 
 /// Binary-STL triangle soup. (ASCII STL is not supported yet — say so
 /// loudly rather than mis-parse.)
-public struct StlMesh {
+public struct StlMesh: Sendable {
     public var triangles: [(SIMD3<Float>, SIMD3<Float>, SIMD3<Float>)]
     public var boundsMin: SIMD3<Float>
     public var boundsMax: SIMD3<Float>

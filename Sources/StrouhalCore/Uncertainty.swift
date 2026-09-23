@@ -54,7 +54,12 @@ public struct StatUncertainty: Sendable {
     public let halfWidth95: Double   // u_stat (already 1.96σ/√M)
     public let batches: Int
     public let lag1: Double          // batch-mean autocorrelation; want |ρ| ≲ 0.3
-    public var trustworthy: Bool { batches >= 6 && abs(lag1) <= 0.3 }
+    /// The QoI does not vary over the sampling window (a steady wake, not a
+    /// shedding one). Batch variance is then ~0, which makes the lag-1
+    /// autocorrelation meaningless — without this flag a perfectly converged
+    /// steady run was reported as "statistics weak".
+    public let steady: Bool
+    public var trustworthy: Bool { steady || (batches >= 6 && abs(lag1) <= 0.3) }
 
     /// Batch length must exceed the integral time scale or the batch means
     /// stay correlated and the CI is a lie (measured: 12 short batches on the
@@ -67,6 +72,7 @@ public struct StatUncertainty: Sendable {
         let v = series.values
         guard v.count >= minBatches * 4 else {
             mean = series.mean; halfWidth95 = .nan; batches = 0; lag1 = .nan
+            steady = false
             return
         }
         func stats(_ M: Int) -> (mean: Double, half: Double, rho: Double) {
@@ -78,7 +84,7 @@ public struct StatUncertainty: Sendable {
             }
             let m = means.reduce(0, +) / Double(M)
             let varSum = means.reduce(0.0) { $0 + ($1 - m) * ($1 - m) }
-            let sd = (varSum / Double(M - 1)).squareRoot()
+            let sd = M > 1 ? (varSum / Double(M - 1)).squareRoot() : 0
             var num = 0.0, den = 0.0
             for i in means.indices {
                 den += (means[i] - m) * (means[i] - m)
@@ -86,6 +92,22 @@ public struct StatUncertainty: Sendable {
             }
             return (m, 1.96 * sd / Double(M).squareRoot(), den > 0 ? num / den : .nan)
         }
+        // A flow that has genuinely gone steady: the whole record varies by a
+        // negligible fraction of its own magnitude. Report that as steady
+        // rather than running it through machinery meant for fluctuations.
+        let whole = stats(1)
+        let lo = v.min() ?? 0, hi = v.max() ?? 0
+        let scale = max(abs(whole.mean), 1e-12)
+        if (hi - lo) / scale < 1e-3 {
+            steady = true
+            batches = 1
+            mean = whole.mean
+            halfWidth95 = (hi - lo) / 2      // the full spread, honestly tiny
+            lag1 = 0
+            return
+        }
+        steady = false
+
         var chosen: (Int, Double, Double, Double)? = nil
         for M in stride(from: maxBatches, through: minBatches, by: -2) {
             let s = stats(M)
@@ -210,6 +232,18 @@ public struct ValidationDomain: Sendable {
         .init(name: "Poiseuille (exact) / Taylor–Green (order 1.96)",
               re: 0...100, mach: 0...0.35, cellsPerFeature: 32...128,
               geometry: "periodic / channel"),
+        // The sphere is anchored by the Schiller–Naumann correlation, which
+        // is itself a ±5% fit to experiment — so a bar inside this domain is
+        // calibrated no better than the correlation it rests on.
+        .init(name: "Sphere drag vs Schiller–Naumann correlation (±5%)",
+              re: 20...300, mach: 0...0.17, cellsPerFeature: 24...64,
+              geometry: "bluff body in free stream"),
+        // Taylor–Green Re=1600 anchors the 3D transitional regime, but it is
+        // a periodic box with no body in it: it says nothing about drag on a
+        // shape, so it deliberately does not serve as a free-stream anchor.
+        .init(name: "Taylor–Green 3D Re=1600 vs Incompact3d 512³ DNS",
+              re: 1600...1600, mach: 0...0.18, cellsPerFeature: 288...320,
+              geometry: "periodic box"),
     ]
 
     public enum Verdict: Sendable {

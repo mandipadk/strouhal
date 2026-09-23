@@ -246,10 +246,19 @@ struct FieldView: View {
                         LabeledValue(label: pair.0, value: pair.1)
                     }
                     Spacer()
-                    Text(controller.perfLine)
-                        .font(.system(size: 12.5))
-                        .foregroundStyle(Ink.dim)
-                        .monospacedDigit()
+                    if controller.preparing {
+                        HStack(spacing: 7) {
+                            ProgressView().controlSize(.small).tint(Ink.amber)
+                            Text("Preparing \(controller.preparingName)…")
+                                .font(.system(size: 12.5))
+                                .foregroundStyle(Ink.amber)
+                        }
+                    } else {
+                        Text(controller.perfLine)
+                            .font(.system(size: 12.5))
+                            .foregroundStyle(Ink.dim)
+                            .monospacedDigit()
+                    }
                 }
                 .padding(.horizontal, 18)
                 .padding(.top, 16)
@@ -278,9 +287,33 @@ struct QoIBand: View {
     @EnvironmentObject var controller: SimController
     var body: some View {
         HStack(alignment: .lastTextBaseline, spacing: 30) {
-            if let cd = controller.liveCD { Numeral(label: "Drag C_D", value: cd, format: "%.3f") }
-            if let cl = controller.liveCL { Numeral(label: "Lift C_L", value: cl, format: "%+.3f") }
-            if let st = controller.liveSt { Numeral(label: "Strouhal St", value: st, format: "%.3f") }
+            if let cd = controller.liveCD {
+                Numeral(label: "Drag C_D", value: cd, format: "%.3f",
+                        settling: controller.settling)
+            }
+            if let cl = controller.liveCL {
+                Numeral(label: "Lift C_L", value: cl, format: "%+.3f",
+                        settling: controller.settling)
+            }
+            if let st = controller.liveSt {
+                Numeral(label: "Strouhal St", value: st, format: "%.3f",
+                        settling: controller.settling)
+            }
+            if controller.settling {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Flow still developing")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(Ink.amber)
+                    ProgressView(value: controller.settlingProgress)
+                        .progressViewStyle(.linear)
+                        .tint(Ink.amber)
+                        .frame(width: 130)
+                    Text("values not meaningful yet")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Ink.faint)
+                }
+                .padding(.bottom, 2)
+            }
             if !controller.staticQoI.isEmpty {
                 Text(controller.staticQoI)
                     .font(.system(size: 13))
@@ -309,6 +342,7 @@ struct Numeral: View {
     let label: String
     let value: Double
     let format: String
+    var settling: Bool = false
     var body: some View {
         VStack(alignment: .leading, spacing: 1) {
             Text(label)
@@ -316,7 +350,7 @@ struct Numeral: View {
                 .foregroundStyle(Ink.dim)
             Text(String(format: format, value))
                 .font(.system(size: 28, weight: .semibold))
-                .foregroundStyle(Ink.text)
+                .foregroundStyle(settling ? Ink.faint : Ink.text)
                 .monospacedDigit()
         }
     }
@@ -419,8 +453,8 @@ struct TruthStrip: View {
                             .font(.system(size: 14, weight: .medium))
                             .foregroundStyle(Ink.text)
                         Text(controller.canHarden
-                             ? "Run a resolution ladder and a Mach anchor (a few minutes on the GPU) to earn its uncertainty."
-                             : "Hardening is available for the vortex street case.")
+                             ? "Run a resolution ladder and a Mach anchor — \(controller.hardenEstimate) on the GPU, while this keeps running — to earn its uncertainty."
+                             : "This case has no free-stream quantity to harden. Try the vortex street, the sphere, or your own imported body.")
                             .font(.system(size: 13))
                             .foregroundStyle(Ink.dim)
                     }
@@ -524,27 +558,33 @@ struct UnitsField: View {
 
 struct FillPill: ButtonStyle {
     var prominent: Bool
+    /// A custom ButtonStyle does NOT inherit a disabled appearance, so without
+    /// this a disabled button looked fully clickable and silently swallowed
+    /// the click — which is how "Harden this number" read as broken.
+    @Environment(\.isEnabled) private var isEnabled
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 13, weight: .semibold))
             .padding(.vertical, 9)
             .padding(.horizontal, 14)
-            .foregroundStyle(prominent ? Color.black.opacity(0.88) : Ink.text)
-            .background(prominent ? Ink.amber : Ink.raised,
+            .foregroundStyle(isEnabled ? (prominent ? Color.black.opacity(0.88) : Ink.text)
+                                       : Ink.faint)
+            .background(isEnabled ? (prominent ? Ink.amber : Ink.raised) : Ink.raised.opacity(0.6),
                         in: RoundedRectangle(cornerRadius: 8))
             .opacity(configuration.isPressed ? 0.75 : 1)
     }
 }
 
 struct OutlinePill: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 12.5, weight: .medium))
             .padding(.vertical, 8)
             .padding(.horizontal, 13)
-            .foregroundStyle(Ink.amber)
+            .foregroundStyle(isEnabled ? Ink.amber : Ink.faint)
             .overlay(RoundedRectangle(cornerRadius: 8)
-                .strokeBorder(Ink.amber.opacity(0.45), lineWidth: 1))
+                .strokeBorder((isEnabled ? Ink.amber : Ink.faint).opacity(0.45), lineWidth: 1))
             .opacity(configuration.isPressed ? 0.7 : 1)
     }
 }
@@ -583,7 +623,10 @@ final class CostTracker: @unchecked Sendable {
 }
 
 /// One running case: the simulation plus everything the UI needs to read it.
-struct ActiveCase {
+/// Built off the main thread, then handed to the main actor once and owned
+/// solely by it thereafter — the same ownership pattern the hardening path
+/// already uses for its background Simulation.
+struct ActiveCase: @unchecked Sendable {
     let sim: Simulation
     let uref: Float
     let zSlice: Int
@@ -622,10 +665,11 @@ final class SimController: NSObject, ObservableObject, MTKViewDelegate {
     @Published var truthLines: [String] = []
     @Published var outsideDomain = false
     private var lastRun: CredibilityRun?
-    /// Only cases with a ladderable definition can be hardened.
-    var canHarden: Bool { selectedCase == .street && !customActive }
+    /// Every case with a free-stream QoI can be hardened — the vortex street,
+    /// the sphere, and imported geometry. The cavity has no such QoI.
+    var canHarden: Bool { hardenPlan != nil }
     /// Rebuilds the current case (builtin picker choice or imported STL).
-    private var currentBuilder: (() throws -> ActiveCase)!
+    private var currentBuilder: (@Sendable () throws -> ActiveCase)!
     var hasHistory: Bool { !history.isEmpty }
     var stlPreview: String {
         guard let mesh = stlMesh else { return "" }
@@ -651,6 +695,17 @@ final class SimController: NSObject, ObservableObject, MTKViewDelegate {
     @Published var envelopeWarnings: [String] = []
     @Published var machTauLine = ""
     @Published var setupPairs: [(String, String)] = []
+    /// True while a case is being built off-thread; the field shows a
+    /// placeholder rather than the previous case's stale pixels.
+    @Published var preparing = false
+    @Published var preparingName = ""
+    /// True while the inflow ramp is still running, or shortly after it ends.
+    /// A drag coefficient read during the ramp is meaningless — the sphere
+    /// shows C_D 0.17 against a reference of 1.09 — so the UI must say so
+    /// instead of letting a wrong number look like an answer.
+    @Published var settling = false
+    @Published var settlingProgress = 0.0
+    private var buildToken: UInt64 = 0
     @Published var machText = ""
     @Published var tauText = ""
     @Published var customActive = false
@@ -709,7 +764,7 @@ final class SimController: NSObject, ObservableObject, MTKViewDelegate {
         }
     }
 
-    static func build(_ c: FlowCase, gpu: GPU) throws -> ActiveCase {
+    nonisolated static func build(_ c: FlowCase, gpu: GPU) throws -> ActiveCase {
         switch c {
         case .street:
             let vs = try VortexStreetCase(gpu: gpu, D: 40, uinMax: 0.075)
@@ -798,6 +853,7 @@ final class SimController: NSObject, ObservableObject, MTKViewDelegate {
     func selectBuiltin() {
         let c = selectedCase
         customActive = false
+        preparingName = c.title
         currentBuilder = { [gpu] in try Self.build(c, gpu: gpu) }
         reset()
     }
@@ -828,25 +884,62 @@ final class SimController: NSObject, ObservableObject, MTKViewDelegate {
         }
         customActive = true
         customName = name
+        preparingName = name
         reset()
     }
 
     /// Run the resolution ladder + Mach anchor on a BACKGROUND GPU queue so
     /// the live view keeps animating. (This is the use case that finally
     /// justifies a second command queue — M3's rendering never needed one.)
+    /// What a "Harden this number" press will run for the current case, or nil
+    /// if the case has no ladder (the cavity has no free-stream QoI).
+    private var hardenPlan: (case: LadderableCase, qoi: String,
+                             rungs: [Int], anchor: Int?, seconds: Double)? {
+        if customActive, let mesh = stlMesh {
+            let re = stlSpeedMS * stlLengthM / (stlFluid == 0 ? 1.5e-5 : 1.0e-6)
+            let rungs = [16, 22, 32]
+            return (BodyLadder(body: .mesh(mesh), name: customName ?? "custom body",
+                               re: re, anchored: false),
+                    "C_D", rungs, 22,
+                    BodyLadder.estimatedSeconds(resolutions: rungs, machAnchor: 22))
+        }
+        switch selectedCase {
+        case .street:
+            return (StreetLadder(), "mean C_D", [32, 48, 64], nil, 690)
+        case .sphere:
+            let rungs = [16, 22, 32]
+            return (BodyLadder(body: .sphere, name: "sphere", re: 100, anchored: true),
+                    "C_D", rungs, 22,
+                    BodyLadder.estimatedSeconds(resolutions: rungs, machAnchor: 22))
+        case .cavity:
+            return nil
+        }
+    }
+
+    /// Human-readable cost, shown BEFORE the user commits minutes of GPU.
+    var hardenEstimate: String {
+        guard let p = hardenPlan else { return "" }
+        let m = Int((p.seconds / 60).rounded())
+        return m <= 1 ? "about a minute" : "about \(m) minutes"
+    }
+
     func harden() {
-        guard canHarden else { return }
+        guard let plan = hardenPlan else { return }
         hardening = true
         hardenStatus = "starting…"
         headline = nil
         truthLines = []
-        let ladderCase = StreetLadder()
+        hardenedValue = nil
+        hardenedU = nil
+        let ladderCase = plan.case
+        let qoi = plan.qoi, rungs = plan.rungs, anchor = plan.anchor
         Task.detached(priority: .userInitiated) {
             do {
                 let bgGPU = try GPU()   // its own device queue: never blocks the render loop
                 let run = try Ladder.credibility(gpu: bgGPU, case: ladderCase,
-                                                 qoi: "mean C_D",
-                                                 resolutions: [32, 48, 64]) { msg in
+                                                 qoi: qoi,
+                                                 resolutions: rungs,
+                                                 machAnchorResolution: anchor) { msg in
                     Task { @MainActor in self.hardenStatus = msg }
                 }
                 await MainActor.run { self.finishHarden(run) }
@@ -878,6 +971,13 @@ final class SimController: NSObject, ObservableObject, MTKViewDelegate {
         case .inside(let a): lines.append("Validation domain: inside — \(a)")
         case .nearEdge(let a, let f): lines.append(String(format: "Validation domain: near the edge of %@ — bar widened ×%.2f", a, f))
         case .outside(let r): lines.append("Validation domain: outside — " + r.joined(separator: "; "))
+        }
+        if let cmp = run.comparison {
+            let e = b.value - cmp.reference
+            lines.append(String(format: "Reference %.4f (%@) · gap %+.1f%% · %@",
+                                cmp.reference, cmp.source, e / cmp.reference * 100,
+                                cmp.covered ? "covered by the uncertainty"
+                                            : "NOT covered — the dominant error is not numerical"))
         }
         lines.append(String(format: "No Richardson/GCI · no model-form claim · %.0f s on the GPU", run.wallSeconds))
         for n in b.notes where !n.isEmpty && !n.hasPrefix("u_num =") { lines.append("⚠ " + n) }
@@ -917,7 +1017,7 @@ final class SimController: NSObject, ObservableObject, MTKViewDelegate {
     /// Flow past an imported body: uniform inflow, periodic lateral, NT body
     /// from the voxelized mesh, sponge before the outlet. LES enables itself
     /// when the Reynolds number pushes tau against the stability floor.
-    static func buildSTLCase(gpu: GPU, mesh: StlMesh, name: String,
+    nonisolated static func buildSTLCase(gpu: GPU, mesh: StlMesh, name: String,
                              lengthM: Double, speedMS: Double, nuSI: Double) throws -> ActiveCase {
         let re = speedMS * lengthM / nuSI
         let D = 48 // cells along the body's longest axis
@@ -992,20 +1092,45 @@ final class SimController: NSObject, ObservableObject, MTKViewDelegate {
             qoiStatic: { _ in String(format: "Frontal area %.0f cells²", area) })
     }
 
+    /// Rebuild the current case. The heavy work (solid fractions, flag array,
+    /// several hundred MB of GPU buffers) runs OFF the main actor: doing it
+    /// inline froze the window for seconds on the 192³ sphere.
     func reset() {
-        do {
-            active = try currentBuilder()
-            fieldTex = Self.makeFieldTexture(device: gpu.device, sim: active.sim)
-            history.removeAll()
-            sparkline = []
-            qoiLine = ""
-            liveCD = nil; liveCL = nil; liveSt = nil; staticQoI = ""
-            hardenedValue = nil; hardenedU = nil
-            truthLines = []; headline = nil
-            syncEnvelope()
-        } catch {
-            statsLine = "case build failed: \(error)"
+        let builder = currentBuilder!
+        let token = buildToken &+ 1
+        buildToken = token
+        preparing = true
+        // Nothing is torn down yet: the outgoing case keeps running with its
+        // own labels and numbers until the new one is ready, so the window
+        // never shows a half-swapped state.
+        Task.detached(priority: .userInitiated) {
+            do {
+                let built = try builder()
+                await MainActor.run { self.adopt(built, token: token) }
+            } catch {
+                await MainActor.run {
+                    guard self.buildToken == token else { return }
+                    self.preparing = false
+                    self.statsLine = "case build failed: \(error)"
+                }
+            }
         }
+    }
+
+    /// Install a freshly built case atomically, unless the user moved on while
+    /// it was building (a newer token wins and this result is discarded).
+    private func adopt(_ built: ActiveCase, token: UInt64) {
+        guard buildToken == token else { return }
+        active = built
+        fieldTex = Self.makeFieldTexture(device: gpu.device, sim: built.sim)
+        history.removeAll()
+        sparkline = []
+        qoiLine = ""
+        liveCD = nil; liveCL = nil; liveSt = nil; staticQoI = ""
+        hardenedValue = nil; hardenedU = nil
+        truthLines = []; headline = nil
+        preparing = false
+        syncEnvelope()
     }
 
     nonisolated func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
@@ -1090,6 +1215,11 @@ final class SimController: NSObject, ObservableObject, MTKViewDelegate {
                                fps, sps, mlups, sim.stepsDone)
             perfLine = String(format: "%.0f fps · %.0f MLUPS · step %@", fps, mlups,
                               NumberFormatter.localizedString(from: NSNumber(value: sim.stepsDone), number: .decimal))
+            // Allow the same span again after the ramp for the wake to establish.
+            let settleEnd = sim.rampSteps * 2
+            settling = sim.rampSteps > 0 && sim.stepsDone < settleEnd
+            settlingProgress = settleEnd > 0
+                ? min(1.0, Double(sim.stepsDone) / Double(settleEnd)) : 1.0
             let st = strouhal()
             liveCD = history.last?.cd
             liveCL = active.strouhalD != nil ? history.last?.cl : nil
