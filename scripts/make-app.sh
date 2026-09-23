@@ -1,6 +1,6 @@
 #!/bin/sh
 # Assemble Strouhal.app from the SwiftPM release build (ad-hoc signed).
-# A designed icon and notarization land at M5.
+# Ad-hoc signed; Developer ID and notarization need an Apple Developer account.
 set -e
 cd "$(dirname "$0")/.."
 swift build -c release
@@ -19,8 +19,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleIdentifier</key><string>com.mandipadk.strouhal</string>
     <key>CFBundleExecutable</key><string>Strouhal</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
-    <key>CFBundleVersion</key><string>0.5.0</string>
-    <key>CFBundleShortVersionString</key><string>0.5.0</string>
+    <key>CFBundleVersion</key><string>0.6.0</string>
+    <key>CFBundleShortVersionString</key><string>0.6.0</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>LSMinimumSystemVersion</key><string>15.0</string>
     <key>NSHighResolutionCapable</key><true/>
