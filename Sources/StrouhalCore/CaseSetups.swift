@@ -106,7 +106,9 @@ public struct SphereCase {
         let (nx, ny, nz) = size
         let nu = Double(u) * Double(D) / re
         let (wp, wm) = Simulation.trtOmegas(tau: 3.0 * nu + 0.5, lambda: 3.0 / 16.0)
-        let cx = 0.5 + 1.5 * Double(D)
+        // Body at 30% of the streamwise extent, so upstream and downstream
+        // run scale with the box instead of staying fixed at 1.5D / 2.5D.
+        let cx = Double(nx) * 0.3
         let cy = Double(ny) / 2.0, cz = Double(nz) / 2.0
         let sim = try Simulation(gpu: gpu, nx: nx, ny: ny, nz: nz,
                                  omega: wp, omegaMinus: wm,
@@ -221,27 +223,53 @@ public struct BodyLadder: LadderableCase {
     public let name: String
     public let re: Double
     public let baseMach: Double        // lattice velocity at full Mach
+    /// Domain extent in body diameters. The lateral walls are periodic, so
+    /// this is literally the spacing of an infinite array of bodies: at 4D
+    /// the blockage is ~4.9% and the drag is biased well outside the
+    /// resolution-and-Mach uncertainty. Varying it is the third error axis.
+    public let boxD: Double
     /// Sphere drag is anchored by the Schiller–Naumann correlation; an
     /// arbitrary imported body has no such anchor, and the report must say so
     /// rather than implying the solver is validated for that shape.
     public let anchored: Bool
 
     public init(body: Body, name: String, re: Double = 100.0,
-                baseMach: Double = 0.05, anchored: Bool = false) {
+                baseMach: Double = 0.05, anchored: Bool = false,
+                boxD: Double = 4.0) {
         self.body = body
         self.name = name
         self.re = re
         self.baseMach = baseMach
         self.anchored = anchored
+        self.boxD = boxD
+    }
+
+    /// Frontal blockage: body frontal area over domain cross-section.
+    public var blockage: Double {
+        switch body {
+        case .sphere: return (Double.pi / 4.0) / (boxD * boxD)
+        case .mesh:   return 1.0 / (boxD * boxD)   // upper bound, refined at build
+        }
     }
 
     public var setupDescription: String {
-        String(format: "%@ · 3D body in a free stream · Re %.0f · uniform inflow, periodic lateral, NT body, outlet sponge",
-               name, re)
+        String(format: "%@ · 3D body in a free stream · Re %.0f · %.0fD box (blockage %.2f%%) · uniform inflow, periodic lateral, NT body, outlet sponge",
+               name, re, boxD, blockage * 100)
     }
     public var geometryClass: String {
         anchored ? "bluff body in free stream" : "custom body in free stream"
     }
+    /// The lateral boundaries are periodic, so the box width IS the spacing
+    /// of an infinite array of bodies. Nothing about a user's problem fixes
+    /// it, which makes it an error to be measured, not a setting to be
+    /// chosen.
+    public static let defaultDomainVariants: [Double] = [4, 6, 8]
+    public var domainVariants: [Double]? { Self.defaultDomainVariants }
+    public func withDomain(_ boxD: Double) -> LadderableCase {
+        BodyLadder(body: body, name: name, re: re, baseMach: baseMach,
+                   anchored: anchored, boxD: boxD)
+    }
+
     /// Schiller–Naumann for the sphere; an imported body has no published
     /// value to compare against, and inventing one would be worse than none.
     public var reference: (value: Double, source: String)? {
@@ -252,10 +280,13 @@ public struct BodyLadder: LadderableCase {
 
     public func variant(gpu: GPU, cellsPerFeature D: Int, machScale: Double) throws -> LadderVariant {
         let u = Float(baseMach * machScale)
-        let (nx, ny, nz) = (4 * D, 4 * D, 4 * D)
+        let span = Int((boxD * Double(D) / 2).rounded()) * 2      // even
+        let (nx, ny, nz) = (span, span, span)
         let nu = Double(u) * Double(D) / re
         let (wp, wm) = Simulation.trtOmegas(tau: 3.0 * nu + 0.5, lambda: 3.0 / 16.0)
-        let cx = 0.5 + 1.5 * Double(D)
+        // Body at 30% of the streamwise extent, so upstream and downstream
+        // run scale with the box instead of staying fixed at 1.5D / 2.5D.
+        let cx = Double(nx) * 0.3
         let cy = Double(ny) / 2.0, cz = Double(nz) / 2.0
         // The ramp scales with the domain crossing time so every rung sees the
         // same physical start-up, not the same step count.
@@ -327,7 +358,12 @@ public struct BodyLadder: LadderableCase {
             // 80 samples at 0.5 D/u spans 40 D/u, comfortably over a period.
             settleTolerance: 0.005,
             settleWindow: 80,
-            maxTransientSteps: Int(tc * 200) & ~1,
+            // The cap must scale with the DOMAIN, not just the body: a
+            // disturbance has to fill and leave the box, which takes
+            // boxD convective times per crossing. Measured: at a fixed
+            // 200 D/u cap the 6D, 8D and 12D boxes all hit it without
+            // settling, so their drag values were not converged.
+            maxTransientSteps: Int(tc * max(200.0, 25.0 * boxD)) & ~1,
             settleStride: max(8, Int(tc / 2)) & ~1)
     }
 
@@ -344,6 +380,15 @@ public struct BodyLadder: LadderableCase {
         }
         var total = resolutions.reduce(0.0) { $0 + cost($1, machScale: 1.0) }
         total += cost(machAnchor, machScale: 0.5)
+        // The blockage ladder: three boxes at the coarsest resolution. Cost
+        // grows as the cube of the box, so the 8D run dominates it.
+        for b in Self.defaultDomainVariants {
+            let d = Double(resolutions.min() ?? 16)
+            let cells = pow(b * d, 3)
+            let tc = d / 0.05
+            let steps = tc * max(200.0, 25.0 * b)
+            total += steps * cells / (mlups * 1e6)
+        }
         return total
     }
 }

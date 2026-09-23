@@ -22,6 +22,9 @@ public struct CredibilityRun: Sendable {
     /// Comparison against a published value, when one exists: the reference,
     /// its source, and whether U(φ) covers the gap.
     public var comparison: (reference: Double, source: String, covered: Bool)? = nil
+    /// Blockage ladder: (blockage fraction, QoI) plus the extrapolated value.
+    public var domainPoints: [(blockage: Double, value: Double)] = []
+    public var domainExtrapolated: Double? = nil
 }
 
 /// A case the ladder can rebuild at an arbitrary resolution and Mach number.
@@ -36,6 +39,15 @@ public protocol LadderableCase: Sendable {
     /// baseline lattice velocity; return (sim, a probe for the QoI, steps to
     /// discard as transient, steps to sample, sampling stride).
     func variant(gpu: GPU, cellsPerFeature: Int, machScale: Double) throws -> LadderVariant
+    /// Domain extents (in feature diameters) to test as a third error axis,
+    /// or nil when the domain is part of the case definition and must not be
+    /// varied — the Schäfer–Turek channel width is specified by the
+    /// benchmark, so changing it would simulate a different problem rather
+    /// than estimate an uncertainty.
+    var domainVariants: [Double]? { get }
+    /// Rebuild this case with a different domain extent.
+    func withDomain(_ boxD: Double) -> LadderableCase
+
     /// A published value this QoI can be compared against, if one exists.
     /// ASME V&V 20 calls the gap the comparison error, E = S − D. Reporting
     /// it is the difference between "our uncertainty is small" and "our
@@ -46,6 +58,8 @@ public protocol LadderableCase: Sendable {
 
 public extension LadderableCase {
     var reference: (value: Double, source: String)? { nil }
+    var domainVariants: [Double]? { nil }
+    func withDomain(_ boxD: Double) -> LadderableCase { self }
 }
 
 public struct LadderVariant {
@@ -144,9 +158,15 @@ public enum Ladder {
     ///   (Taylor–Green Re=1600: peak 0.011888 at Ma 0.130 vs 0.011887 at
     ///   Ma 0.173, a difference of one part in 10⁴), and anchoring on the
     ///   finest 3D rung would roughly double an already long run.
+    /// - Parameter domainResolution: resolution for the domain (blockage)
+    ///   ladder. Coarser than the finest rung, because the blockage
+    ///   correction is an additive property of the boundary placement rather
+    ///   than of the grid — the same reasoning as the Mach anchor, and it
+    ///   keeps a three-box sweep affordable.
     public static func credibility(gpu: GPU, case c: LadderableCase, qoi name: String,
                                    resolutions: [Int],
                                    machAnchorResolution: Int? = nil,
+                                   domainResolution: Int? = nil,
                                    progress: ((String) -> Void)? = nil) throws -> CredibilityRun {
         let t0 = Date()
         var rungs: [LadderRung] = []
@@ -178,6 +198,24 @@ public enum Ladder {
         // rung it was run at, not against the finest.
         let machBase = rungs.first { $0.cellsPerFeature == anchorAt }?.value ?? rungs.last!.value
 
+        // The third axis: how much of this answer is the box rather than the
+        // body. Invisible to a resolution ladder, because every rung shares
+        // the same boundaries.
+        var domain: DomainUncertainty? = nil
+        if let boxes = c.domainVariants, boxes.count >= 2 {
+            let dRes = domainResolution ?? resolutions.min()!
+            var pts: [(blockage: Double, value: Double)] = []
+            for b in boxes.sorted() {
+                progress?("domain \(Int(b))D box at \(dRes) cells…")
+                let variant = c.withDomain(b)
+                guard let bl = (variant as? BodyLadder)?.blockage else { continue }
+                let dv = try variant.variant(gpu: gpu, cellsPerFeature: dRes, machScale: 1.0)
+                let (ds, _, _, _) = try measure(dv, qoi: name)
+                pts.append((blockage: bl, value: ds.mean))
+            }
+            if pts.count >= 2 { domain = DomainUncertainty(points: pts) }
+        }
+
         let num = NumUncertainty(rungs: rungs)
         let stat = finestStat!
         let mach = MachUncertainty(baseline: machBase, halfMach: halfSeries.mean)
@@ -197,9 +235,21 @@ public enum Ladder {
         if let l = c as? BodyLadder, !l.anchored {
             notes.append("no validated anchor for this geometry: the components below are measured, but that the solver reproduces reality for THIS shape is not established")
         }
-        let budget = UncertaintyBudget(qoi: name, value: rungs.last!.value,
+        // Apply the blockage correction to the finest-resolution value: the
+        // user wants drag on their body, not drag on an infinite array of
+        // copies of it, and the box is a numerical artifact rather than part
+        // of their problem. Wind-tunnel practice corrects for blockage for
+        // exactly this reason.
+        let corrected = rungs.last!.value + (domain?.correction ?? 0)
+        if let d = domain {
+            notes.append(String(format: "blockage corrected: %.4f in the base box → %.4f extrapolated to an unbounded domain (%+.1f%%); %@",
+                                rungs.last!.value, corrected,
+                                (corrected - rungs.last!.value) / rungs.last!.value * 100, d.note))
+        }
+        let budget = UncertaintyBudget(qoi: name, value: corrected,
                                        uNum: num.uNum, uStat: stat.halfWidth95,
-                                       uMa: mach.uMa, verdict: verdict, notes: notes)
+                                       uMa: mach.uMa, uDomain: domain?.uDomain ?? .nan,
+                                       verdict: verdict, notes: notes)
         return CredibilityRun(qoi: name, budget: budget, rungs: rungs,
                               numNote: num.note, observedOrder: num.observedOrder,
                               statBatches: stat.batches, statLag1: stat.lag1,
@@ -212,7 +262,9 @@ public enum Ladder {
                               comparison: c.reference.map { ref in
                                   (reference: ref.value, source: ref.source,
                                    covered: abs(budget.value - ref.value) <= budget.combined)
-                              })
+                              },
+                              domainPoints: domain?.points ?? [],
+                              domainExtrapolated: domain?.extrapolated)
     }
 }
 
@@ -229,13 +281,19 @@ public enum CredibilityReport {
         s += "\(r.setup)\n\n"
 
         s += "## Uncertainty budget\n\n"
-        s += "U(φ) = k·√(u_num² + u_stat² + u_Ma²), k = 2 (≈95%)\n\n"
+        s += r.budget.uDomain.isNaN
+            ? "U(φ) = k·√(u_num² + u_stat² + u_Ma²), k = 2 (≈95%)\n\n"
+            : "U(φ) = k·√(u_num² + u_stat² + u_Ma² + u_domain²), k = 2 (≈95%)\n\n"
         s += "| Component | Value | Basis |\n|---|---|---|\n"
         s += String(format: "| u_num (discretization) | %.4f | %@ |\n", r.budget.uNum, r.numNote)
         s += String(format: "| u_stat (time average) | %.4f | non-overlapping batch means, %d batches, lag-1 ρ = %.2f |\n",
                     r.budget.uStat, r.statBatches, r.statLag1)
         s += String(format: "| u_Ma (compressibility) | %.4f | half-Mach anchor: %.4f → %.4f, O(Ma²) extrapolation |\n",
                     r.budget.uMa, r.machBaseline, r.machHalf)
+        if !r.budget.uDomain.isNaN {
+            s += String(format: "| u_domain (blockage) | %.4f | %d domain sizes extrapolated to an unbounded box |\n",
+                        r.budget.uDomain, r.domainPoints.count)
+        }
         switch r.budget.verdict {
         case .inside(let a):
             s += String(format: "| **U(φ) (k=2)** | **%.4f** | inside the validated domain (%@) |\n",
@@ -259,6 +317,20 @@ public enum CredibilityReport {
             s += "\nNo observed order reported: the ladder is not monotone-convergent, so a fitted order would be meaningless.\n"
         }
         s += "\n"
+
+        if !r.domainPoints.isEmpty {
+            s += "## Domain (blockage) ladder\n\n"
+            s += "The lateral boundaries are periodic, so a finite box is an infinite array of bodies. This is the error a resolution ladder cannot see, because every rung shares the same boundaries.\n\n"
+            s += "| blockage | φ |\n|---|---|\n"
+            for pt in r.domainPoints.sorted(by: { $0.blockage > $1.blockage }) {
+                s += String(format: "| %.3f%% | %.4f |\n", pt.blockage * 100, pt.value)
+            }
+            if let e = r.domainExtrapolated {
+                s += String(format: "| **0 (unbounded)** | **%.4f** |\n", e)
+            }
+            s += "\nThe reported result carries this correction. It is an extrapolation from the two largest domains, not a fit through all of them: the dependence is linear only at small blockage.\n\n"
+            s += "**Stated assumption:** the blockage ladder runs at a coarser grid than the finest resolution rung, so the correction is assumed independent of resolution. That is plausible — blockage is set by where the boundaries are, not by how finely the body is resolved — but it is an assumption, not a measurement, and it is the weakest link in this budget.\n\n"
+        }
 
         s += "## Validation domain\n\n"
         switch r.budget.verdict {

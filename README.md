@@ -39,7 +39,7 @@ Physics gates currently passing (run them yourself, see below):
 | Vortex street (DFG 2D-2) | Schäfer & Turek (1996) | St 0.2996 [0.295, 0.305], max C_L 0.9998 [0.99, 1.01] |
 | **Taylor–Green 3D, Re 1600** | Incompact3d 512³ DNS / HiOCFD | peak ε at t* 9.09 (DNS 8.98); finest pair converged to 0.25%; peak −7.5% with the deficit attributed by measurement (compressibility ruled out; 2nd-order resolution) |
 | Curved boundaries (Noble–Torczynski) | DFG 2D-2 peaks | max C_L gate active at D=64 |
-| Sphere drag, hardened | Schiller–Naumann correlation (±5%) | resolution ladder + Mach anchor, calibrated bar |
+| Sphere drag, hardened | Schiller–Naumann correlation (±5%) | C_D = 1.0714 ± 0.0916 (k=2), −1.9% — the bar covers the reference |
 | Bitwise determinism | — | identical SHA-256 state digests, both precisions |
 
 Streaming/parity proofs: rest states are bitwise fixed points; a lone
@@ -80,12 +80,36 @@ reference — if something fails on your machine, that's a bug report we want.
 Any quantity the app reports can be *hardened*: it re-runs the case across a
 resolution ladder and a half-Mach anchor and assembles
 
-    U(φ) = k·√(u_num² + u_stat² + u_Ma²),  k = 2 (≈95%)
+    U(φ) = k·√(u_num² + u_stat² + u_Ma² + u_domain²),  k = 2 (≈95%)
 
 then attaches a validation-domain verdict and exports a Markdown report in
 ASME V&V 20 vocabulary. This works on the built-in cases and on your own
 imported geometry. It costs minutes, and it runs on a second GPU queue so the
 live view keeps going.
+
+### Why there is a domain term
+
+Resolution and time-averaging are the components everyone quantifies. They
+were not the dominant error here, and a resolution ladder cannot see the one
+that was: every rung shares the same boundaries.
+
+The lateral boundaries are periodic, so a finite box is an infinite array of
+bodies. Measured on the sphere at Re = 100:
+
+| box | blockage | C_D | vs reference |
+|---|---|---|---|
+| 4D | 4.91% | 1.4938 | +36.8% |
+| 6D | 2.18% | 1.2540 | +14.9% |
+| 8D | 1.23% | 1.1881 | +8.8% |
+| extrapolated | 0 | 1.1032 | +1.1% |
+
+Before this term existed, the tool reported C_D = 1.3591 ± 0.0621 against a
+reference of 1.0917: an error five times the stated uncertainty, from a
+machine built to catch exactly that. With the domain measured and corrected
+it reports **1.0714 ± 0.0916, which covers the reference.** The gate that
+asserts this coverage is the one that matters most in the suite.
+
+### Settling
 
 The transient is not a guessed number of steps. Each run continues until its
 quantity genuinely stops moving, because a guess here is silently wrong: the

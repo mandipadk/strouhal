@@ -1340,15 +1340,17 @@ func runBodyCredibility(gpu: GPU, resolutions: [Int] = [16, 22, 32]) throws -> [
     print(String(format: "      (estimate %.0f s)", est))
     let run = try Ladder.credibility(gpu: gpu, case: ladder, qoi: "C_D",
                                      resolutions: resolutions,
-                                     machAnchorResolution: resolutions.sorted()[resolutions.count / 2]) {
+                                     machAnchorResolution: resolutions.sorted()[resolutions.count / 2],
+                                     domainResolution: resolutions.min()!) {
         print("      … \($0)")
     }
     let b = run.budget
 
     out.append(GateResult(name: "M6 sphere produces a calibrated bar",
                           passed: b.combined.isFinite && b.combined > 0,
-                          detail: String(format: "%@ · u_num %.4f, u_stat %.4f, u_Ma %.4f · %.0f s wall (est %.0f)",
-                                         b.headline, b.uNum, b.uStat, b.uMa, run.wallSeconds, est)))
+                          detail: String(format: "%@ · u_num %.4f, u_stat %.4f, u_Ma %.4f, u_domain %.4f · %.0f s wall (est %.0f)",
+                                         b.headline, b.uNum, b.uStat, b.uMa, b.uDomain,
+                                         run.wallSeconds, est)))
 
     // Schiller–Naumann is a ±5% correlation for an unbounded sphere; our box
     // is finite, so the gate is generous and REPORTS the gap rather than
@@ -1356,8 +1358,8 @@ func runBodyCredibility(gpu: GPU, resolutions: [Int] = [16, 22, 32]) throws -> [
     let cdRef = 24.0 / re * (1.0 + 0.15 * pow(re, 0.687))
     let err = abs(b.value - cdRef) / cdRef
     out.append(GateResult(name: "M6 sphere C_D near Schiller–Naumann",
-                          passed: err <= 0.30,
-                          detail: String(format: "%.4f vs %.4f (%+.1f%%, gate ≤30%%: finite box + NT effective radius; correlation itself ±5%%)",
+                          passed: err <= 0.10,
+                          detail: String(format: "%.4f vs %.4f (%+.1f%%, gate ≤10%% after the blockage correction; correlation itself ±5%%)",
                                          b.value, cdRef, (b.value - cdRef) / cdRef * 100)))
 
     let lad = run.rungs.map { String(format: "%d:%.4f", $0.cellsPerFeature, $0.value) }
@@ -1375,19 +1377,54 @@ func runBodyCredibility(gpu: GPU, resolutions: [Int] = [16, 22, 32]) throws -> [
                           detail: weak ? "FAILED: reported weak statistics on a steady QoI"
                                        : "steady QoI reported as steady (batches \(run.statBatches))"))
 
+    // THE gate. Everything else is machinery; this asks whether the machinery
+    // produces an answer that covers reality on a case whose answer is known.
+    // Before the blockage axis existed, the sphere read 1.3591 ± 0.0621
+    // against a reference of 1.0917 — the bar was a fifth of the error.
+    if let cmp = run.comparison {
+        let e = run.budget.value - cmp.reference
+        // Schiller–Naumann is itself a ±5% fit to experiment, so agreement is
+        // only meaningful to that tolerance: the bar must cover the gap once
+        // the correlation's own band is allowed for.
+        let refBand = 0.05 * cmp.reference
+        let covers = abs(e) <= run.budget.combined + refBand
+        out.append(GateResult(name: "M6 the bar covers the reference",
+                              passed: covers,
+                              detail: String(format: "%.4f ± %.4f vs %.4f ±5%% → gap %+.1f%%, %@",
+                                             run.budget.value, run.budget.combined,
+                                             cmp.reference, e / cmp.reference * 100,
+                                             covers ? "COVERED" : "not covered")))
+    }
+
+    if !run.domainPoints.isEmpty {
+        let pts = run.domainPoints.sorted { $0.blockage > $1.blockage }
+        let monotone = zip(pts, pts.dropFirst()).allSatisfy { $0.value > $1.value }
+        out.append(GateResult(name: "M6 drag falls monotonically as the box grows",
+                              passed: monotone,
+                              detail: pts.map { String(format: "%.2f%%:%.4f", $0.blockage * 100, $0.value) }
+                                  .joined(separator: " → ")
+                                + (run.domainExtrapolated.map { String(format: " → 0%%:%.4f", $0) } ?? "")))
+    }
+
     // The product's hardest honesty test. The sphere in a 4D box sits well
     // outside its own error bar relative to Schiller–Naumann, because the
     // finite domain biases the drag. The tool must SAY that the uncertainty
     // fails to cover the gap rather than letting a small bar imply a correct
     // answer — the FDA nozzle failure mode, caught in our own output.
+    // Assert that the tool's coverage CLAIM matches its own arithmetic,
+    // whichever way it falls. An earlier version of this gate asserted the
+    // gap was specifically uncovered, which baked the tool's then-broken
+    // state in as the expected one — the gate started failing the moment the
+    // product got better, which is exactly backwards.
     if let cmp = run.comparison {
         let e = b.value - cmp.reference
-        let statesIt = !cmp.covered
-        out.append(GateResult(name: "M6 reports the comparison error honestly",
-                              passed: statesIt,
-                              detail: String(format: "E = S − D = %+.4f (%+.1f%%) vs U(φ) = %.4f → reported as %@",
+        let truthfully = (abs(e) <= b.combined) == cmp.covered
+        out.append(GateResult(name: "M6 coverage claim matches the arithmetic",
+                              passed: truthfully,
+                              detail: String(format: "E = S − D = %+.4f (%+.1f%%) vs U(φ) = %.4f → reports %@ (%@)",
                                              e, e / cmp.reference * 100, b.combined,
-                                             cmp.covered ? "covered" : "NOT covered (correct: the bar is numerical only)")))
+                                             cmp.covered ? "covered" : "NOT covered",
+                                             truthfully ? "consistent" : "INCONSISTENT with its own numbers")))
     }
 
     // The adversarial half: an unanchored geometry must NOT receive a
@@ -1432,4 +1469,24 @@ func debugSettleTrigger(gpu: GPU, D: Int) throws {
                  D, Double(v.sim.stepsDone) / tc, converged ? "converged" : "HIT CAP",
                  stat.mean, stat.steady ? "yes" : "no", stat.halfWidth95, stat.batches))
     _ = series
+}
+
+/// Measure how drag depends on domain size. The lateral boundaries are
+/// periodic, so a 4D box is an infinite array of bodies 4 diameters apart;
+/// this sweep asks how much of our +24.5% gap to Schiller–Naumann is that.
+func debugDomainSweep(gpu: GPU, D: Int = 16, boxes: [Double] = [4, 6, 8, 12]) throws {
+    let re = 100.0
+    let cdRef = 24.0 / re * (1.0 + 0.15 * pow(re, 0.687))
+    print(String(format: "sphere Re=%.0f  D=%d  reference (Schiller–Naumann) %.4f", re, D, cdRef))
+    print("   box     blockage      C_D     vs ref   settled")
+    for b in boxes {
+        let ladder = BodyLadder(body: .sphere, name: "sphere", re: re,
+                                anchored: true, boxD: b)
+        let v = try ladder.variant(gpu: gpu, cellsPerFeature: D, machScale: 1.0)
+        let (_, stat, _, converged) = try Ladder.measure(v, qoi: "C_D")
+        print(String(format: "  %4.0fD   %7.3f%%   %7.4f   %+6.1f%%   %@",
+                     b, ladder.blockage * 100, stat.mean,
+                     (stat.mean - cdRef) / cdRef * 100,
+                     converged ? "yes" : "CAP"))
+    }
 }

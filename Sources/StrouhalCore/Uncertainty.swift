@@ -200,6 +200,68 @@ public struct MachUncertainty: Sendable {
     }
 }
 
+/// Domain (blockage) uncertainty for a free-stream case.
+///
+/// The lateral boundaries are periodic, so a finite box simulates an infinite
+/// array of bodies. Measured on the sphere at Re=100: drag runs +36.8% over
+/// the reference in a 4D box, +14.9% at 6D, +8.8% at 8D, +5.3% at 12D. That
+/// is not a small correction hiding under the resolution uncertainty — it was
+/// the dominant error in the result, and it is invisible to a resolution
+/// ladder because every rung shares the same box.
+///
+/// We extrapolate to zero blockage using the two LARGEST boxes, since the
+/// dependence is only linear at small blockage (the measured slope steepens
+/// from 0.056 to 0.088 per percent as blockage grows). The uncertainty is the
+/// disagreement between that extrapolation and the one from the next pair —
+/// the same finest-pair logic used for resolution, and for the same reason:
+/// it assumes nothing about the order of the trend.
+public struct DomainUncertainty: Sendable {
+    /// (blockage fraction, QoI) sorted by decreasing box size.
+    public let points: [(blockage: Double, value: Double)]
+    /// QoI extrapolated to an unbounded domain, when the trend supports it.
+    public let extrapolated: Double?
+    /// Correction from the base (smallest) box to the unbounded estimate.
+    public let correction: Double
+    public let uDomain: Double
+    public let note: String
+
+    public init(points raw: [(blockage: Double, value: Double)]) {
+        // Sort by blockage ascending: biggest box first.
+        let p = raw.sorted { $0.blockage < $1.blockage }
+        points = p
+        guard p.count >= 2 else {
+            extrapolated = nil; correction = 0; uDomain = .nan
+            note = "single domain size — blockage error not estimated"
+            return
+        }
+        /// Linear extrapolation to zero blockage through two points.
+        func toZero(_ a: (blockage: Double, value: Double),
+                    _ b: (blockage: Double, value: Double)) -> Double? {
+            let dB = b.blockage - a.blockage
+            guard abs(dB) > 1e-9 else { return nil }
+            let slope = (b.value - a.value) / dB
+            return a.value - slope * a.blockage
+        }
+        guard let fine = toZero(p[0], p[1]) else {
+            extrapolated = nil; correction = 0; uDomain = .nan
+            note = "degenerate domain ladder"
+            return
+        }
+        extrapolated = fine
+        correction = fine - (p.last!.value)          // relative to the base box
+        if p.count >= 3, let next = toZero(p[1], p[2]) {
+            uDomain = abs(fine - next)
+            note = String(format: "extrapolated to zero blockage from the two largest domains; u_domain is the disagreement with the next pair (%.4f vs %.4f)",
+                          fine, next)
+        } else {
+            // With only two boxes the extrapolation has no self-check, so the
+            // whole correction is taken as its own uncertainty.
+            uDomain = abs(fine - p[0].value)
+            note = "only two domain sizes: no independent check on the extrapolation, so the full correction is carried as uncertainty"
+        }
+    }
+}
+
 /// Where this run sits relative to the cases the solver has actually been
 /// validated against (Oberkampf & Roy's validation domain). Inside → the bar
 /// is calibrated. Outside → say so; do not launder an extrapolation as a
@@ -300,11 +362,14 @@ public struct UncertaintyBudget: Sendable {
     public let uNum: Double
     public let uStat: Double
     public let uMa: Double
+    /// Blockage / finite-domain uncertainty; NaN when the domain is part of
+    /// the case definition and must not be varied.
+    public let uDomain: Double
     public let verdict: ValidationDomain.Verdict
     public let notes: [String]
 
     public var combined: Double {
-        let parts = [uNum, uStat, uMa].filter { !$0.isNaN }
+        let parts = [uNum, uStat, uMa, uDomain].filter { !$0.isNaN }
         let rss = parts.reduce(0.0) { $0 + $1 * $1 }.squareRoot()
         switch verdict {
         case .inside: return 2.0 * rss
@@ -314,9 +379,11 @@ public struct UncertaintyBudget: Sendable {
     }
 
     public init(qoi: String, value: Double, uNum: Double, uStat: Double, uMa: Double,
+                uDomain: Double = .nan,
                 verdict: ValidationDomain.Verdict, notes: [String] = []) {
         self.qoi = qoi; self.value = value
         self.uNum = uNum; self.uStat = uStat; self.uMa = uMa
+        self.uDomain = uDomain
         self.verdict = verdict; self.notes = notes
     }
 

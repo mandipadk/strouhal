@@ -51,6 +51,9 @@ func main() throws {
         let tEnd = args.dropFirst(3).first.flatMap { Double($0) } ?? 10.5
         _ = try tgvRun(gpu: gpu, n: n, u0: u0, tEnd: tEnd) { print("      \($0)") }
         results = []
+    case "domainsweep":
+        try debugDomainSweep(gpu: gpu, D: args.dropFirst().first.flatMap { Int($0) } ?? 16)
+        results = []
     case "debugsettle":
         try debugSettleTrigger(gpu: gpu, D: args.dropFirst().first.flatMap { Int($0) } ?? 28)
         results = []

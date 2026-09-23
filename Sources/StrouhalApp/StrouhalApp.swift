@@ -962,8 +962,18 @@ final class SimController: NSObject, ObservableObject, MTKViewDelegate {
         hardenedU = b.combined.isNaN ? nil : b.combined
         if case .outside = b.verdict { outsideDomain = true } else { outsideDomain = false }
         var lines: [String] = []
-        lines.append(String(format: "Grid ±%.4f · Statistics ±%.4f · Compressibility ±%.4f — combined at 95%% (k = 2)",
-                            b.uNum, b.uStat, b.uMa))
+        var comps = String(format: "Grid ±%.4f · Statistics ±%.4f · Compressibility ±%.4f",
+                           b.uNum, b.uStat, b.uMa)
+        if !b.uDomain.isNaN { comps += String(format: " · Blockage ±%.4f", b.uDomain) }
+        lines.append(comps + " — combined at 95% (k = 2)")
+        if let e = run.domainExtrapolated, !run.domainPoints.isEmpty {
+            let biggest = run.domainPoints.min { $0.blockage < $1.blockage }
+            lines.append(String(format: "Blockage ladder: %@ → %.4f extrapolated to an unbounded domain",
+                                run.domainPoints.sorted { $0.blockage > $1.blockage }
+                                    .map { String(format: "%.2f%%:%.4f", $0.blockage * 100, $0.value) }
+                                    .joined(separator: " · "), e))
+            _ = biggest
+        }
         lines.append("Resolution ladder " + run.rungs.map { String(format: "%d cells → %.4f", $0.cellsPerFeature, $0.value) }
                         .joined(separator: " · ")
                      + String(format: " · half-Mach %.4f → %.4f", run.machBaseline, run.machHalf))
