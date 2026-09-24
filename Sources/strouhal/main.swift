@@ -62,6 +62,9 @@ func main() throws {
         let tc = args.dropFirst(2).first.flatMap { Double($0) } ?? 80
         try debugBodySettling(gpu: gpu, D: d, convectiveTimes: tc)
         results = []
+    case "m7":
+        print("— internal flow: Hagen–Poiseuille in a pipe —")
+        results = try runPipe(gpu: gpu)
     case "m6":
         print("— hardening a 3D body: the sphere credibility run —")
         results = try runBodyCredibility(gpu: gpu)

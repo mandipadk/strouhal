@@ -392,3 +392,89 @@ public struct BodyLadder: LadderableCase {
         return total
     }
 }
+
+/// Solid fraction for a circular pipe: solid OUTSIDE radius r, replicated
+/// along x. Note the curvature is concave from the fluid's side, the opposite
+/// of every curved boundary validated so far (cylinder, sphere), so this is a
+/// genuinely new test of the Noble–Torczynski treatment rather than a rerun.
+public func pipeSolidFractions(nx: Int, ny: Int, nz: Int,
+                               cy: Double, cz: Double, r: Double) -> [Float] {
+    var eps = [Float](repeating: 0, count: nx * ny * nz)
+    let r2 = r * r
+    let sub = 16
+    for z in 0..<nz {
+        for y in 0..<ny {
+            var outside = 0
+            for sy in 0..<sub { for sz in 0..<sub {
+                let py = Double(y) - 0.5 + (Double(sy) + 0.5) / Double(sub)
+                let pz = Double(z) - 0.5 + (Double(sz) + 0.5) / Double(sub)
+                let dy = py - cy, dz = pz - cz
+                if dy * dy + dz * dz > r2 { outside += 1 }
+            }}
+            let f = Float(outside) / Float(sub * sub)
+            for x in 0..<nx { eps[(z * ny + y) * nx + x] = f }
+        }
+    }
+    return eps
+}
+
+/// Pressure-driven laminar flow in a circular pipe — the foundation of every
+/// duct, manifold and cooling channel, and one of the few internal flows with
+/// an exact solution:
+///
+///     u(r) = F (R² − r²) / (4ν),   u_mean = F R² / (8ν),   f · Re = 64
+///
+/// Periodic along the axis with a uniform body force, which is exactly a
+/// constant pressure gradient dp/dx = −F.
+public struct PipeCase {
+    public let sim: Simulation
+    public let D: Int
+    public let radius: Double
+    public let nu: Double
+    public let force: Double
+    public let eps: [Float]
+
+    public init(gpu: GPU, D: Int = 32, tau: Double = 0.8, uMax: Double = 0.05,
+                length: Int = 8) throws {
+        let nu = (tau - 0.5) / 3.0
+        let r = Double(D) / 2.0
+        // Choose the force that would give the target centreline velocity.
+        let F = 4.0 * nu * uMax / (r * r)
+        let (wp, wm) = Simulation.trtOmegas(tau: tau, lambda: 3.0 / 16.0)
+        let span = D + 4
+        let sim = try Simulation(gpu: gpu, nx: length, ny: span, nz: span,
+                                 omega: wp, omegaMinus: wm,
+                                 force: SIMD3(Float(F), 0, 0)) { _, _, _ in .fluid }
+        let c = Double(span) / 2.0
+        let eps = pipeSolidFractions(nx: length, ny: span, nz: span,
+                                     cy: c, cz: c, r: r)
+        try sim.setSolidFractions(eps)
+        self.sim = sim
+        self.D = D
+        self.radius = r
+        self.nu = nu
+        self.force = F
+        self.eps = eps
+    }
+
+    /// Flow rate, effective open area and mean velocity, weighting each cell
+    /// by its fluid fraction so the bookkeeping matches the geometry the
+    /// solver actually sees.
+    public func flow(_ moments: UnsafeBufferPointer<SIMD4<Float>>) -> (q: Double, area: Double, uMean: Double, uMax: Double) {
+        let nx = sim.nx, ny = sim.ny, nz = sim.nz
+        let x = nx / 2
+        var q = 0.0, area = 0.0, uMax = 0.0
+        for z in 0..<nz {
+            for y in 0..<ny {
+                let n = (z * ny + y) * nx + x
+                let open = 1.0 - Double(eps[n])
+                guard open > 0 else { continue }
+                let u = Double(moments[n].x)
+                q += u * open
+                area += open
+                uMax = max(uMax, u)
+            }
+        }
+        return (q, area, area > 0 ? q / area : 0, uMax)
+    }
+}

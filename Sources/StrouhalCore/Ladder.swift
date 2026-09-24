@@ -22,6 +22,9 @@ public struct CredibilityRun: Sendable {
     /// Comparison against a published value, when one exists: the reference,
     /// its source, and whether U(φ) covers the gap.
     public var comparison: (reference: Double, source: String, covered: Bool)? = nil
+    /// Set when the resolution ladder is not converging fast enough for the
+    /// finest-pair difference to stand for the remaining error.
+    public var asymptoticNote: String = ""
     /// Blockage ladder: (blockage fraction, QoI) plus the extrapolated value.
     public var domainPoints: [(blockage: Double, value: Double)] = []
     public var domainExtrapolated: Double? = nil
@@ -223,6 +226,7 @@ public enum Ladder {
                                                 cellsPerFeature: finest,
                                                 geometry: c.geometryClass)
         var notes: [String] = [num.note]
+        if !num.asymptotic { notes.append("⚠ " + num.asymptoticNote) }
         if stat.steady {
             notes.append("QoI is steady over the sampling window — statistical uncertainty is negligible, not unmeasured")
         } else if !stat.trustworthy {
@@ -263,6 +267,7 @@ public enum Ladder {
                                   (reference: ref.value, source: ref.source,
                                    covered: abs(budget.value - ref.value) <= budget.combined)
                               },
+                              asymptoticNote: num.asymptotic ? "" : num.asymptoticNote,
                               domainPoints: domain?.points ?? [],
                               domainExtrapolated: domain?.extrapolated)
     }
@@ -309,6 +314,9 @@ public enum CredibilityReport {
         s += "## Resolution ladder\n\n| cells/feature | φ | u_stat |\n|---|---|---|\n"
         for rung in r.rungs {
             s += String(format: "| %d | %.4f | %.4f |\n", rung.cellsPerFeature, rung.value, rung.stat)
+        }
+        if !r.asymptoticNote.isEmpty {
+            s += "\n**\(r.asymptoticNote)**\n"
         }
         if let o = r.observedOrder {
             s += String(format: "\nObserved order of convergence: **%.2f** — reported as a diagnostic only. ", o)

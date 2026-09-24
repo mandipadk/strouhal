@@ -40,6 +40,7 @@ Physics gates currently passing (run them yourself, see below):
 | **Taylor–Green 3D, Re 1600** | Incompact3d 512³ DNS / HiOCFD | peak ε at t* 9.09 (DNS 8.98); finest pair converged to 0.25%; peak −7.5% with the deficit attributed by measurement (compressibility ruled out; 2nd-order resolution) |
 | Curved boundaries (Noble–Torczynski) | DFG 2D-2 peaks | max C_L gate active at D=64 |
 | Sphere drag, hardened | Schiller–Naumann correlation (±5%) | C_D = 1.0714 ± 0.0916 (k=2), −1.9% — the bar covers the reference |
+| Pipe flow (internal, curved wall) | Hagen–Poiseuille, f·Re = 64 exactly | 64.38 at D=64 (+0.60%), observed order 0.96 |
 | Bitwise determinism | — | identical SHA-256 state digests, both precisions |
 
 Streaming/parity proofs: rest states are bitwise fixed points; a lone
@@ -68,6 +69,7 @@ swift build -c release
 .build/release/strouhal m4      # the credibility run: ladder + Mach anchor + report
 .build/release/strouhal m5      # Taylor-Green Re=1600 vs published DNS
 .build/release/strouhal m6      # hardening a 3D body: the sphere credibility run
+.build/release/strouhal m7      # internal flow: Hagen-Poiseuille in a pipe
 .build/release/StrouhalApp      # the live instrument
 sh scripts/make-app.sh          # bundle dist/Strouhal.app
 ```
@@ -108,6 +110,28 @@ reference of 1.0917: an error five times the stated uncertainty, from a
 machine built to catch exactly that. With the domain measured and corrected
 it reports **1.0714 ± 0.0916, which covers the reference.** The gate that
 asserts this coverage is the one that matters most in the suite.
+
+### What the pipe measured about curved walls
+
+Flat no-slip walls use halfway bounce-back and are exact: the plane
+Poiseuille profile matches analysis to 4×10⁻⁷. A *curved* wall does not get
+that, and the pipe says how much not. Against f·Re = 64:
+
+| cells across | f·Re | error |
+|---|---|---|
+| 16 | 65.45 | 2.27% |
+| 32 | 64.79 | 1.23% |
+| 64 | 64.38 | 0.60% |
+
+Observed order **0.96** — curved boundaries converge at first order, while the
+bulk scheme is second order. That is worth knowing on its own, and it prompted
+a check of the sphere's own resolution ladder, whose observed order is **0.13**:
+successive rungs there change by nearly the same amount, so the finest-pair
+difference is not an estimate of what remains. The tool now detects that and
+says so instead of presenting a tidy number produced by an untidy ladder.
+
+This is also the first curved-boundary case that is concave from the fluid's
+side. Everything validated before it — cylinder, sphere — bulged outward.
 
 ### Settling
 

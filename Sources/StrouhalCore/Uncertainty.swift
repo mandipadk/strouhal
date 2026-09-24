@@ -181,7 +181,33 @@ public struct NumUncertainty: Sendable {
         } else {
             note = "u_num = |finest − next| (no Richardson/GCI: invalid for scale-resolving runs)"
         }
+
+        // Asymptotic-range check. The finest-pair difference is only a fair
+        // estimate of what remains when the ladder is actually converging.
+        // If successive differences barely shrink, the ladder has not reached
+        // its asymptotic range and the remaining discretization error can be
+        // far larger than the last step — measured on the sphere, successive
+        // deltas of 0.0163 and 0.0155 give an observed order of 0.13, where
+        // an order-based estimate of what remains would be twenty times
+        // u_num. That extrapolation is not trustworthy at such a low order,
+        // so we do not report it as a number; we report that the ladder
+        // cannot support one.
+        if let o = order, o < 1.0 {
+            asymptotic = false
+            asymptoticNote = String(format: "resolution ladder is NOT in its asymptotic range (observed order %.2f): successive rungs are still changing by nearly the same amount, so u_num understates the discretization error. Refine further before relying on it.", o)
+        } else if order == nil {
+            asymptotic = false
+            asymptoticNote = "resolution ladder is not monotone-convergent, so u_num is a spread between rungs rather than an estimate of what remains"
+        } else {
+            asymptotic = true
+            asymptoticNote = ""
+        }
     }
+
+    /// Whether the ladder is converging fast enough for the finest-pair
+    /// difference to represent the remaining error.
+    public private(set) var asymptotic: Bool = true
+    public private(set) var asymptoticNote: String = ""
 }
 
 /// Compressibility uncertainty: LBM is weakly compressible, error is O(Ma²).
